@@ -1,0 +1,14 @@
+# 发布用镜像：二进制由 GoReleaser 在 CI 里交叉编译好，这里只做**打包**。
+#
+# 为什么不在镜像里 `go build`：多架构构建时 BuildKit 会用 QEMU 模拟 arm64 跑编译器，
+# 而 cloudflared 依赖很重，单这一步要 13 分钟以上。COPY 不需要模拟执行，两个平台的镜像
+# 几秒就能构建完。从源码构建镜像仍可用根目录的 Dockerfile。
+FROM gcr.io/distroless/static-debian12:nonroot
+
+# 工作流按平台把对应架构的二进制放进构建上下文（vultro-engine-linux-amd64 / -arm64）。
+ARG TARGETARCH
+COPY vultro-engine-linux-${TARGETARCH} /usr/local/bin/vultro-engine
+
+EXPOSE 8787
+USER nonroot:nonroot
+ENTRYPOINT ["/usr/local/bin/vultro-engine"]

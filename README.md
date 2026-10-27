@@ -160,8 +160,11 @@ go build -o vultro-engine . && go test ./...
 
 1. 读取 `version.md` 的版本号，把补丁位 +1（1.0.0 → 1.0.1），回写并推送到 `main`；
 2. 在回写提交上打 `v<版本>` 标签；
-3. GoReleaser 产出四平台（linux/darwin × amd64/arm64）归档 + `checksums.txt`，
-   并构建推送镜像 `ghcr.io/atticus6/vultro-engine:<版本>` 与 `:latest`。
+3. GoReleaser 产出四平台（linux/darwin × amd64/arm64）归档 + `checksums.txt`；
+4. 镜像直接打包第 3 步的 linux 二进制（`Dockerfile.release`，不在容器里重新编译），
+   推送 `ghcr.io/atticus6/vultro-engine:<版本>` 与 `:latest`。
+
+整条流水线约 4 分钟：主要的耗时是交叉编译四个平台，镜像打包只需几秒。
 
 `version.md` 记录的是**最近一次发布的版本**；要跳大版本 / 小版本时手工改它，
 下一次发布从新值继续 +1。版本回写提交只改 `version.md`，不会再次触发发布。

@@ -3,7 +3,10 @@
 # 每次推送依次执行：
 #   1. prepare：读 `version.md`，补丁位 +1，回写并推送，随后在回写提交上打 `v<版本>` 标签；
 #   2. binaries：在**新标签**上跑 GoReleaser（四平台归档 + checksums.txt）；
-#   3. image：在**新标签**上构建推送多架构镜像。
+#   3. image：取回第 2 步产出的 linux 二进制，打包成多架构镜像推送。
+#
+# 速度取向：镜像只做打包（Dockerfile.release），不在 QEMU 里重新编译。旧做法用根目录
+# Dockerfile 在 arm64 上跑 `go build`，单这一步就要 13 分钟；现在整条流水线约 4 分钟。
 #
 # 两个必须注意的点：
 # - `paths-ignore: version.md`：版本回写提交只改这一个文件，不能再触发一次发布（否则每次
@@ -97,14 +100,33 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   image:
-    needs: prepare
+    needs: [prepare, binaries]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.prepare.outputs.version }}
+          # 只需要 Dockerfile.release 与 .dockerignore，不需要历史。
+          fetch-depth: 1
 
-      - uses: docker/setup-qemu-action@v3
+      # 直接复用 GoReleaser 刚发布的 linux 二进制——镜像里不再编译，省掉 QEMU 模拟。
+      - name: 取回已编译的 linux 二进制
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          plain="${VERSION#v}"
+          base="https://github.com/${REPO}/releases/download/${VERSION}"
+          for arch in amd64 arm64; do
+            tmp=$(mktemp -d)
+            curl -fsSL "$base/vultro-engine_${plain}_linux_${arch}.tar.gz" | tar -xz -C "$tmp"
+            mv "$tmp/vultro-engine" "vultro-engine-linux-${arch}"
+            rm -rf "$tmp"
+            test -s "vultro-engine-linux-${arch}"
+          done
+          ls -lh vultro-engine-linux-*
+
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
@@ -126,9 +148,8 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: .
+          file: Dockerfile.release
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            VERSION=${{ needs.prepare.outputs.version }}
