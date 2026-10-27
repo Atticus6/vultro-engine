@@ -2,7 +2,7 @@
 //
 // 不做"真的替换当前二进制"的测试——那会在这个进程上执行 exec，而且需要真实的
 // release 资产；替换逻辑的正确性靠冒烟检查（新二进制 --version）与原子 rename 保证。
-package main
+package selfupdate
 
 import (
 	"archive/tar"

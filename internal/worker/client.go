@@ -1,9 +1,10 @@
-// Worker 客户端：引擎 → Worker 的全部出站调用（注册/心跳/进度/finish/relay fetch/分片上传）。
+// Package worker 是引擎 → Worker 的唯一出站通道：注册、心跳、进度、finish、
+// relay 取流与分片上传全部在这里。
 //
 // 所有请求都带引擎令牌或任务令牌（Bearer）；对 5xx/网络错误做指数退避重试，
 // 4xx（除 408/429）视为终态失败不重试——那通常是状态已变（会话被取消/过期），
 // 重试只会撞同一堵墙。
-package main
+package worker
 
 import (
 	"bytes"
@@ -14,26 +15,28 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/atticus6/vultro-engine/internal/buildinfo"
 )
 
-// WorkerClient 引擎对 Worker 的出站客户端。
-type WorkerClient struct {
+// Client 引擎对 Worker 的出站客户端。
+type Client struct {
 	baseURL string
 	token   string
 	http    *http.Client
 	log     *slog.Logger
 }
 
-// NewWorkerClient 构造客户端。http.Client 由调用方注入（direct 模式时带代理 Transport）。
-func NewWorkerClient(baseURL, token string, httpClient *http.Client, log *slog.Logger) *WorkerClient {
+// NewClient 构造客户端。http.Client 由调用方注入（direct 模式时带代理 Transport）。
+func NewClient(baseURL, token string, httpClient *http.Client, log *slog.Logger) *Client {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 10 * time.Minute}
 	}
-	return &WorkerClient{baseURL: baseURL, token: token, http: httpClient, log: log}
+	return &Client{baseURL: baseURL, token: token, http: httpClient, log: log}
 }
 
 // do 发一个 JSON 请求并解析 JSON 响应；带退避重试。
-func (w *WorkerClient) do(ctx context.Context, method, path string, body any, out any, bearer string) error {
+func (c *Client) do(ctx context.Context, method, path string, body any, out any, bearer string) error {
 	var payload []byte
 	if body != nil {
 		var err error
@@ -55,17 +58,17 @@ func (w *WorkerClient) do(ctx context.Context, method, path string, body any, ou
 			}
 		}
 
-		req, err := http.NewRequestWithContext(ctx, method, w.baseURL+path, bytes.NewReader(payload))
+		req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bytes.NewReader(payload))
 		if err != nil {
 			return fmt.Errorf("构造请求: %w", err)
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+bearer)
 
-		resp, err := w.http.Do(req)
+		resp, err := c.http.Do(req)
 		if err != nil {
 			lastErr = err
-			w.log.Warn("worker 请求失败，将重试", "path", path, "attempt", attempt+1, "err", err)
+			c.log.Warn("worker 请求失败，将重试", "path", path, "attempt", attempt+1, "err", err)
 			continue
 		}
 
@@ -88,7 +91,7 @@ func (w *WorkerClient) do(ctx context.Context, method, path string, body any, ou
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
 		resp.Body.Close()
 		lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, snippet)
-		w.log.Warn("worker 请求可重试失败", "path", path, "attempt", attempt+1, "status", resp.StatusCode)
+		c.log.Warn("worker 请求可重试失败", "path", path, "attempt", attempt+1, "status", resp.StatusCode)
 	}
 	return fmt.Errorf("重试耗尽: %w", lastErr)
 }
@@ -103,12 +106,12 @@ func (e *PermanentError) Error() string { return e.Msg }
 // **不发送 id**：身份完全由令牌决定——Worker 按 `Authorization` 里的 `eng_…` 反查节点行。
 // 请求体里再带一个 id 会让"我是谁"出现两个来源（而其中一个可以随便填）。引擎 id 仍留在
 // 本地配置里，因为日志与运维对账要用它显示。
-func (w *WorkerClient) Register(ctx context.Context, cfg *Config) error {
-	return w.do(ctx, http.MethodPost, "/api/offline/engines/register", map[string]any{
-		"publicUrl": cfg.PublicURL,
-		"capacity":  cfg.Capacity,
-		"version":   Version,
-	}, nil, w.token)
+func (c *Client) Register(ctx context.Context, publicURL string, capacity int) error {
+	return c.do(ctx, http.MethodPost, "/api/offline/engines/register", map[string]any{
+		"publicUrl": publicURL,
+		"capacity":  capacity,
+		"version":   buildinfo.Version,
+	}, nil, c.token)
 }
 
 // Heartbeat 心跳：刷新 lastSeenAt、上报版本与排水状态；返回 dispatchHint。
@@ -118,25 +121,25 @@ func (w *WorkerClient) Register(ctx context.Context, cfg *Config) error {
 //
 // 上报 `draining` 是关键：Worker 据此把本节点从派发候选里排除——否则排空期间
 // 新任务还会被派过来（引擎虽然会 503，但那要多一次往返且任务要重新排队）。
-func (w *WorkerClient) Heartbeat(ctx context.Context, engineID, version string, draining bool) (bool, error) {
+func (c *Client) Heartbeat(ctx context.Context, draining bool) (bool, error) {
 	var out struct {
 		DispatchHint bool `json:"dispatchHint"`
 	}
 	body, err := json.Marshal(map[string]any{
-		"version":  version,
+		"version":  buildinfo.Version,
 		"draining": draining,
 	})
 	if err != nil {
 		return false, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		w.baseURL+"/api/offline/engines/heartbeat", bytes.NewReader(body))
+		c.baseURL+"/api/offline/engines/heartbeat", bytes.NewReader(body))
 	if err != nil {
 		return false, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+w.token)
-	resp, err := w.http.Do(req)
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return false, err
 	}
@@ -147,14 +150,12 @@ func (w *WorkerClient) Heartbeat(ctx context.Context, engineID, version string, 
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return false, err
 	}
-	// engineID 只用于调用方日志；身份已经由令牌表达，不再上网。
-	_ = engineID
 	return out.DispatchHint, nil
 }
 
 // ReportProgress 进度回报（节流由调用方负责）。
-func (w *WorkerClient) ReportProgress(ctx context.Context, taskToken string, taskID string, downloaded int64) error {
-	return w.do(ctx, http.MethodPost, "/api/offline/tasks/"+taskID+"/progress",
+func (c *Client) ReportProgress(ctx context.Context, taskToken string, taskID string, downloaded int64) error {
+	return c.do(ctx, http.MethodPost, "/api/offline/tasks/"+taskID+"/progress",
 		map[string]any{"downloadedBytes": downloaded}, nil, taskToken)
 }
 
@@ -166,32 +167,32 @@ type FinishResult struct {
 }
 
 // Finish 交还结果（成功 → Worker 结算扇出；失败 → abort + 传导）。
-func (w *WorkerClient) Finish(ctx context.Context, taskToken string, taskID string, result FinishResult) error {
-	return w.do(ctx, http.MethodPost, "/api/offline/tasks/"+taskID+"/finish", result, nil, taskToken)
+func (c *Client) Finish(ctx context.Context, taskToken string, taskID string, result FinishResult) error {
+	return c.do(ctx, http.MethodPost, "/api/offline/tasks/"+taskID+"/finish", result, nil, taskToken)
 }
 
 // FetchRange relay 出口：经 Worker 取源站的一段字节（源站只见 Cloudflare 出口）。
 // 返回上游响应（调用方负责关闭 body）。
-func (w *WorkerClient) FetchRange(ctx context.Context, taskToken string, taskID, url, rangeHeader string) (*http.Response, error) {
+func (c *Client) FetchRange(ctx context.Context, taskToken string, taskID, url, rangeHeader string) (*http.Response, error) {
 	body, err := json.Marshal(map[string]any{"url": url, "range": rangeHeader})
 	if err != nil {
 		return nil, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		w.baseURL+"/api/offline/tasks/"+taskID+"/fetch", bytes.NewReader(body))
+		c.baseURL+"/api/offline/tasks/"+taskID+"/fetch", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+taskToken)
-	return w.http.Do(req)
+	return c.http.Do(req)
 }
 
 // UploadPart 分片上传：直 PUT Worker 的既有分片路由（与浏览器客户端同一契约）。
 // body 长度必须精确等于 expected（服务端按字节长度硬校验）。
-func (w *WorkerClient) UploadPart(ctx context.Context, taskToken string, sessionID string, partNumber int, expected int64, body io.Reader) error {
+func (c *Client) UploadPart(ctx context.Context, taskToken string, sessionID string, partNumber int, expected int64, body io.Reader) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut,
-		fmt.Sprintf("%s/api/upload/%s/part/%d", w.baseURL, sessionID, partNumber), body)
+		fmt.Sprintf("%s/api/upload/%s/part/%d", c.baseURL, sessionID, partNumber), body)
 	if err != nil {
 		return err
 	}
@@ -199,7 +200,7 @@ func (w *WorkerClient) UploadPart(ctx context.Context, taskToken string, session
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("Authorization", "Bearer "+taskToken)
 
-	resp, err := w.http.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return err
 	}
@@ -215,9 +216,9 @@ func (w *WorkerClient) UploadPart(ctx context.Context, taskToken string, session
 }
 
 // UploadSingle 单次上传（≤8 MiB 的会话走这条）。
-func (w *WorkerClient) UploadSingle(ctx context.Context, taskToken string, sessionID string, expected int64, body io.Reader) error {
+func (c *Client) UploadSingle(ctx context.Context, taskToken string, sessionID string, expected int64, body io.Reader) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut,
-		fmt.Sprintf("%s/api/upload/%s/content", w.baseURL, sessionID), body)
+		fmt.Sprintf("%s/api/upload/%s/content", c.baseURL, sessionID), body)
 	if err != nil {
 		return err
 	}
@@ -225,7 +226,7 @@ func (w *WorkerClient) UploadSingle(ctx context.Context, taskToken string, sessi
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("Authorization", "Bearer "+taskToken)
 
-	resp, err := w.http.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return err
 	}

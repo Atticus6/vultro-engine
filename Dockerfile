@@ -9,12 +9,13 @@ ARG VERSION=dev
 WORKDIR /src
 
 # 先只拷依赖清单：源码改动不会让 `go mod download` 的层缓存失效。
-COPY go.mod ./
-RUN go mod download 2>/dev/null || true
+COPY go.mod go.sum ./
+RUN go mod download
 
-COPY *.go ./
+COPY main.go ./
+COPY internal ./internal
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
-    -ldflags "-s -w -X main.Version=${VERSION}" \
+    -ldflags "-s -w -X github.com/atticus6/vultro-engine/internal/buildinfo.Version=${VERSION}" \
     -o /out/vultro-engine .
 
 FROM gcr.io/distroless/static-debian12:nonroot

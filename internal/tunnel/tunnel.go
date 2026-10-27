@@ -1,5 +1,6 @@
-// 内嵌 cloudflared 临时隧道（quick tunnel）：进程内起一条 `*.trycloudflare.com` 隧道，
-// 把本机 `ENGINE_ADDR` 暴露给 Worker，启动后**自动上报地址**（不再需要手工配隧道）。
+// Package tunnel 在进程内起一条 cloudflared 临时隧道（quick tunnel），
+// 把本机 HTTP 服务暴露成 `https://*.trycloudflare.com`，启动后自动上报地址
+// 给 Worker（不再需要手工配隧道）。
 //
 // ## 为什么是"内嵌 CLI 命令图"而不是某个 SDK 函数
 //
@@ -20,12 +21,13 @@
 //   - 连接协议默认 `http2`（TCP 7844）：不少机房/网络封 UDP，`quic` 会一直
 //     "no recent network activity"；`auto` 留给网络条件好的部署；
 //   - 隧道断开时进程退出（由 systemd/容器重启，重启后地址与注册都会刷新）。
-package main
+package tunnel
 
 import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"regexp"
 	"strings"
@@ -35,6 +37,8 @@ import (
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/cliutil"
 	tunnelcmd "github.com/cloudflare/cloudflared/cmd/cloudflared/tunnel"
 	"github.com/urfave/cli/v2"
+
+	"github.com/atticus6/vultro-engine/internal/buildinfo"
 )
 
 // quickTunnelURLRe 匹配 quick tunnel 分配的公网地址。
@@ -44,12 +48,28 @@ var quickTunnelURLRe = regexp.MustCompile(`https://[a-z0-9-]+\.trycloudflare\.co
 // 太短会在慢网络下误判失败；太长会让引擎启动看起来卡住。
 const quickTunnelReadyTimeout = 90 * time.Second
 
+// LocalURL 把监听地址转成隧道应当访问的本机 URL。
+//
+// 监听在通配地址（`:8787` / `0.0.0.0:8787` / `[::]:8787`）时用 127.0.0.1 访问：
+// 部分环境里通配地址不是可拨号地址。显式指定了主机则原样保留。
+func LocalURL(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		// 不含端口的畸形值：保持"看起来像个地址"的原样行为，交给 ListenAndServe 报错。
+		return "http://" + addr
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	return "http://" + net.JoinHostPort(host, port)
+}
+
 // StartQuickTunnel 在进程内启动 quick tunnel，返回可被 Worker 访问的公网地址。
 //
 // 返回时隧道已**完成注册**（可以立即接收请求）。隧道在后台随 ctx 存活；
 // ctx 取消后 cloudflared 退出。
 //
-// @param localURL 本地来源，形如 `http://127.0.0.1:8787`。
+// @param localURL 本地来源，形如 `http://127.0.0.1:8787`（见 LocalURL）。
 // @param protocol `http2` / `quic` / `auto`，透传 cloudflared 的 `--protocol`。
 func StartQuickTunnel(ctx context.Context, localURL, protocol string, log *slog.Logger) (string, error) {
 	if protocol == "" {
@@ -62,12 +82,12 @@ func StartQuickTunnel(ctx context.Context, localURL, protocol string, log *slog.
 
 	app := &cli.App{
 		Name:     "cloudflared",
-		Version:  Version,
+		Version:  buildinfo.Version,
 		Flags:    tunnelcmd.Flags(),
 		Commands: tunnelcmd.Commands(),
 	}
 	// Init 设置全局 build info 与优雅退出通道；不调用会让日志/版本上报取到空值。
-	tunnelcmd.Init(cliutil.GetBuildInfo("embedded", Version), make(chan struct{}))
+	tunnelcmd.Init(cliutil.GetBuildInfo("embedded", buildinfo.Version), make(chan struct{}))
 
 	/*
 	 * **不要**在函数返回时 cancel：隧道必须活到进程退出。

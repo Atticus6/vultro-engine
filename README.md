@@ -135,7 +135,24 @@ tunnel、不需要配 DNS、不需要公网 IP。启动后到后台「离线节�
 go build -o vultro-engine . && go test ./...
 ```
 
-版本号注入：`go build -ldflags "-X main.Version=v1.0.0"`（CI 已自动处理）。
+版本号注入：`go build -ldflags "-X github.com/atticus6/vultro-engine/internal/buildinfo.Version=v1.0.0"`
+（CI 已自动处理）。
+
+## 目录结构
+
+根目录只有 `main.go`（装配层：读配置 → 起服务 → 开隧道 → 注册/心跳），业务逻辑按职责
+拆在 `internal/`：
+
+| 包                     | 职责                                                                     |
+| ---------------------- | ------------------------------------------------------------------------ |
+| `internal/config`      | 环境变量 → 配置（Fail Fast）                                             |
+| `internal/buildinfo`   | 链接器注入的版本号（注册/心跳/健康检查共用）                             |
+| `internal/worker`      | 引擎 → Worker 的全部出站调用（注册/心跳/进度/finish/relay/分片上传）     |
+| `internal/download`    | 单个任务的下载循环（Range GET → 内存一片 → 上传）与错误分类              |
+| `internal/server`      | 入站 HTTP（派发/取消/健康检查/自更新）与节点级状态（槽位、排水、在途数） |
+| `internal/tunnel`      | 内嵌 cloudflared quick tunnel 与本地 URL 推导                            |
+| `internal/egress`      | 取源站的出口：relay / warp（用户态 WireGuard）/ direct（含 http 代理）  |
+| `internal/selfupdate`  | 下载 release、校验、原子替换并 exec 重生                                 |
 
 ## 发布
 

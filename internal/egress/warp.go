@@ -15,10 +15,10 @@
 //
 // ## 两个容易踩的坑（都实测过）
 //
-// 1. 身份里的 WireGuard 密钥是 **base64**，而 `wireguard-go` 的 `IpcSet` 只认 **hex**；
-// 2. `endpoint` 必须是**数字 IP:port**（新版 `netip.ParseAddr` 不认域名），而 identity
-//    里的 `Endpoint.V4` 形如 `162.159.192.4:0`（带一个占位端口），要拆开再拼。
-package main
+//  1. 身份里的 WireGuard 密钥是 **base64**，而 `wireguard-go` 的 `IpcSet` 只认 **hex**；
+//  2. `endpoint` 必须是**数字 IP:port**（新版 `netip.ParseAddr` 不认域名），而 identity
+//     里的 `Endpoint.V4` 形如 `162.159.192.4:0`（带一个占位端口），要拆开再拼。
+package egress
 
 import (
 	"context"

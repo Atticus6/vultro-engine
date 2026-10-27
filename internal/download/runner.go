@@ -1,46 +1,23 @@
-// 下载执行器：单个任务的下载循环（源站 Range GET → 内存一片 → 分片上传 Worker）。
+// 下载循环：逐片 Range GET → 内存一片 → 分片上传 Worker → finish 交还结果。
 //
-// v1 不落盘：每片 ≤64 MiB 缓冲在内存（与 Worker 侧分片上限一致），下载完一片传一片。
-// 断点续传不需要引擎侧任何持久化：改派时 Worker 在派发载荷里给出已传分片号
-// （来自 R2 ListParts），跳过即可。
-package main
+// 一个任务一个 goroutine；并发上限（槽位）由 server 的信号量控制，不在这里做。
+package download
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/atticus6/vultro-engine/internal/worker"
 )
 
-// DownloadTask 派发载荷（Worker → 引擎，`POST /v1/tasks` 的 body）。
-// JSON 字段名与 TS 侧 `DispatchPayload` 逐字对应。
-type DownloadTask struct {
-	TaskID    string `json:"taskId"`
-	TaskToken string `json:"taskToken"`
-	Source    struct {
-		URL string `json:"url"`
-	} `json:"source"`
-	Session struct {
-		ID            string `json:"id"`
-		Mode          string `json:"mode"` // single | multipart
-		PartSize      int64  `json:"partSize"`
-		PartCount     int    `json:"partCount"`
-		Size          int64  `json:"size"`
-		UploadedParts []int  `json:"uploadedParts"`
-	} `json:"session"`
-	Egress struct {
-		Mode string `json:"mode"`
-	} `json:"egress"`
-	DeadlineMs int64 `json:"deadlineMs"`
-}
-
-// Runner 执行下载任务（一个任务一个 goroutine，槽位由 server 的信号量控制）。
+// Runner 执行下载任务。
 type Runner struct {
-	worker *WorkerClient
+	client *worker.Client
 	log    *slog.Logger
 
 	// 源站客户端：`warp`（WARP 出口）/ `direct`（直连或上游代理）时用它。
@@ -55,14 +32,14 @@ type Runner struct {
 	// 进度回报的最小间隔（节流 D1 写入）。
 	progressInterval time.Duration
 
-	// 取消登记表（server 在受理/取消时增删；Runner 持有引用）。
+	// 取消登记表：受理/取消/判重都经由 Runner 的方法访问，server 不直接碰它。
 	cancels *cancelRegistry
 }
 
 // NewRunner 构造执行器。
-func NewRunner(worker *WorkerClient, source *http.Client, egressMode string, log *slog.Logger) *Runner {
+func NewRunner(client *worker.Client, source *http.Client, egressMode string, log *slog.Logger) *Runner {
 	return &Runner{
-		worker:           worker,
+		client:           client,
 		source:           source,
 		egressMode:       egressMode,
 		log:              log,
@@ -71,7 +48,18 @@ func NewRunner(worker *WorkerClient, source *http.Client, egressMode string, log
 	}
 }
 
-// cancelRegistry 取消登记表：taskID → cancel。server 在受理/取消时增删。
+// Cancel 置取消标记：当前分片做完即停（≤1 片的浪费）。返回任务是否存在。
+func (r *Runner) Cancel(taskID string) bool {
+	return r.cancels.cancel(taskID)
+}
+
+// IsRunning 任务是否在跑（重复派发判重用）。
+func (r *Runner) IsRunning(taskID string) bool {
+	_, running := r.cancels.lookup(taskID)
+	return running
+}
+
+// cancelRegistry 取消登记表：taskID → cancel。
 type cancelRegistry struct {
 	mu      sync.Mutex
 	cancels map[string]context.CancelFunc
@@ -114,7 +102,7 @@ func (r *cancelRegistry) lookup(taskID string) (context.CancelFunc, bool) {
 
 // Run 执行一个任务到终态（成功/失败都由这里 finish；不向调用方返回错误——
 // finish 的成败只影响 Worker 侧状态，引擎侧记录日志即可）。
-func (r *Runner) Run(parentCtx context.Context, task DownloadTask) {
+func (r *Runner) Run(parentCtx context.Context, task Task) {
 	ctx, cancel := context.WithCancel(parentCtx)
 	r.cancels.add(task.TaskID, cancel)
 	defer r.cancels.remove(task.TaskID)
@@ -124,7 +112,7 @@ func (r *Runner) Run(parentCtx context.Context, task DownloadTask) {
 	if task.DeadlineMs > 0 {
 		deadline := time.UnixMilli(task.DeadlineMs)
 		if !deadline.After(time.Now()) {
-			r.finish(ctx, task, FinishResult{OK: false, Code: "expired", Message: "任务已过期"})
+			r.finish(task, worker.FinishResult{OK: false, Code: "expired", Message: "任务已过期"})
 			return
 		}
 		var deadlineCancel context.CancelFunc
@@ -137,17 +125,17 @@ func (r *Runner) Run(parentCtx context.Context, task DownloadTask) {
 
 	if err := r.runParts(ctx, parentCtx, task, log); err != nil {
 		code, message := classifyError(err)
-		r.finish(ctx, task, FinishResult{OK: false, Code: code, Message: message})
+		r.finish(task, worker.FinishResult{OK: false, Code: code, Message: message})
 		return
 	}
 
 	// 全部分片上传完成 → finish(ok)，Worker 侧自建清单核对并 complete。
-	r.finish(ctx, task, FinishResult{OK: true})
+	r.finish(task, worker.FinishResult{OK: true})
 	log.Info("下载完成", "size", task.Session.Size)
 }
 
 // runParts 逐片取字节并上传。
-func (r *Runner) runParts(ctx context.Context, parentCtx context.Context, task DownloadTask, log *slog.Logger) error {
+func (r *Runner) runParts(ctx context.Context, parentCtx context.Context, task Task, log *slog.Logger) error {
 	// 已传分片集合（改派场景：跳过，不重传）。
 	uploaded := make(map[int]bool, len(task.Session.UploadedParts))
 	for _, n := range task.Session.UploadedParts {
@@ -169,10 +157,10 @@ func (r *Runner) runParts(ctx context.Context, parentCtx context.Context, task D
 			return err
 		}
 		defer body.Close()
-		if err := r.worker.UploadSingle(ctx, task.TaskToken, task.Session.ID, task.Session.Size, body); err != nil {
+		if err := r.client.UploadSingle(ctx, task.TaskToken, task.Session.ID, task.Session.Size, body); err != nil {
 			return err
 		}
-		_ = r.worker.ReportProgress(ctx, task.TaskToken, task.TaskID, task.Session.Size)
+		_ = r.client.ReportProgress(ctx, task.TaskToken, task.TaskID, task.Session.Size)
 		return nil
 	}
 
@@ -213,7 +201,7 @@ func (r *Runner) runParts(ctx context.Context, parentCtx context.Context, task D
 				}
 				continue
 			}
-			err = r.worker.UploadPart(ctx, task.TaskToken, task.Session.ID, part, length, body)
+			err = r.client.UploadPart(ctx, task.TaskToken, task.Session.ID, part, length, body)
 			_ = body.Close()
 			if err == nil {
 				downloaded += length
@@ -233,22 +221,22 @@ func (r *Runner) runParts(ctx context.Context, parentCtx context.Context, task D
 		// 进度节流：每片或 ≥1s 一次。
 		if time.Since(lastProgress) >= r.progressInterval {
 			lastProgress = time.Now()
-			if err := r.worker.ReportProgress(ctx, task.TaskToken, task.TaskID, downloaded); err != nil {
+			if err := r.client.ReportProgress(ctx, task.TaskToken, task.TaskID, downloaded); err != nil {
 				log.Warn("进度回报失败（忽略）", "err", err)
 			}
 		}
 	}
 	// 最终进度补一次（确保 Worker 侧显示 100%）。
-	_ = r.worker.ReportProgress(ctx, task.TaskToken, task.TaskID, downloaded)
+	_ = r.client.ReportProgress(ctx, task.TaskToken, task.TaskID, downloaded)
 	return nil
 }
 
 // fetchRange 取源站的一段字节。relay 走 Worker 的 fetch 端点；warp/direct 由引擎出网。
-func (r *Runner) fetchRange(ctx context.Context, task DownloadTask, rangeHeader string) (io.ReadCloser, error) {
+func (r *Runner) fetchRange(ctx context.Context, task Task, rangeHeader string) (io.ReadCloser, error) {
 	if r.egressMode != "relay" {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, task.Source.URL, nil)
 		if err != nil {
-			return nil, &PermanentError{Msg: "构造源站请求失败: " + err.Error()}
+			return nil, &worker.PermanentError{Msg: "构造源站请求失败: " + err.Error()}
 		}
 		req.Header.Set("Range", rangeHeader)
 		req.Header.Set("User-Agent", "Vultro-Engine/1.0")
@@ -264,13 +252,13 @@ func (r *Runner) fetchRange(ctx context.Context, task DownloadTask, rangeHeader 
 	}
 
 	// relay：经 Worker 出口（url 精确匹配白名单在 Worker 侧校验）。
-	resp, err := r.worker.FetchRange(ctx, task.TaskToken, task.TaskID, task.Source.URL, rangeHeader)
+	resp, err := r.client.FetchRange(ctx, task.TaskToken, task.TaskID, task.Source.URL, rangeHeader)
 	if err != nil {
 		return nil, err
 	}
 	if resp.StatusCode == http.StatusForbidden {
 		resp.Body.Close()
-		return nil, &PermanentError{Msg: "relay 出口拒绝（URL 与任务不匹配）"}
+		return nil, &worker.PermanentError{Msg: "relay 出口拒绝（URL 与任务不匹配）"}
 	}
 	if resp.StatusCode >= 400 {
 		resp.Body.Close()
@@ -280,64 +268,11 @@ func (r *Runner) fetchRange(ctx context.Context, task DownloadTask, rangeHeader 
 }
 
 // finish 交还结果（失败只记录，不 panic）。
-func (r *Runner) finish(_ context.Context, task DownloadTask, result FinishResult) {
+func (r *Runner) finish(task Task, result worker.FinishResult) {
+	// 用 background 派生：任务 ctx 可能已被取消（取消场景也要把 finish 送出去）。
 	finishCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	// 用 background 派生：ctx 可能已被取消（取消场景也要把 finish 送出去）。
-	if err := r.worker.Finish(finishCtx, task.TaskToken, task.TaskID, result); err != nil {
+	if err := r.client.Finish(finishCtx, task.TaskToken, task.TaskID, result); err != nil {
 		r.log.Error("finish 上报失败（Worker 侧 Cron 会兜底收敛）", "task", task.TaskID, "err", err)
 	}
-}
-
-// partLength 第 n 片长度（除末片外等大；与 Worker 侧 expectedPartLength 同一公式）。
-func partLength(size, partSize int64, partCount, partNumber int) int64 {
-	if partNumber == partCount {
-		return size - partSize*int64(partCount-1)
-	}
-	return partSize
-}
-
-// classifyError 引擎侧错误 → 结构化失败码（与 Worker 侧错误码表对齐）。
-func classifyError(err error) (code, message string) {
-	if pe, ok := err.(*PermanentError); ok {
-		if containsAny(pe.Msg, "404", "410") {
-			return "source-error-4xx", pe.Msg
-		}
-		return "source-error-5xx", pe.Msg
-	}
-	if errors.Is(err, context.DeadlineExceeded) || containsAny(err.Error(), "超时") {
-		return "deadline", "任务超时"
-	}
-	if errors.Is(err, context.Canceled) || containsAny(err.Error(), "取消") {
-		return "cancelled", "任务被取消"
-	}
-	return "source-error-5xx", err.Error()
-}
-
-func containsAny(s string, subs ...string) bool {
-	for _, sub := range subs {
-		if contains(s, sub) {
-			return true
-		}
-	}
-	return false
-}
-
-func contains(s, sub string) bool {
-	return len(sub) > 0 && len(s) >= len(sub) && indexOf(s, sub) >= 0
-}
-
-func indexOf(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
-}
-
-// isPermanent 判断是否不可重试。
-func isPermanent(err error) bool {
-	_, ok := err.(*PermanentError)
-	return ok
 }

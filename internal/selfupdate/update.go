@@ -1,4 +1,4 @@
-// 自更新：从 GitHub Release 下载新的引擎二进制、校验、原子替换并重启自己。
+// Package selfupdate 让引擎从 GitHub Release 下载新二进制、校验、原子替换并重启自己。
 //
 // ## 为什么由引擎自己更新（而不是 Worker 下发文件）
 //
@@ -15,12 +15,12 @@
 //
 // ## 安全与可恢复性
 //
-// - 校验和解压失败**绝不覆盖**现有二进制（先写临时文件，全部成功才 rename）；
-// - 替换前用新二进制执行一次 `--version` 做冒烟检查，防止把一个损坏/架构不符的文件
-//   装上去把自己弄死；
-// - 需要二进制所在目录可写（`/usr/local/bin` 通常要 root；容器内默认 root 或改用
-//   compose 里的镜像更新）。
-package main
+//   - 校验和解压失败**绝不覆盖**现有二进制（先写临时文件，全部成功才 rename）；
+//   - 替换前用新二进制执行一次 `--version` 做冒烟检查，防止把一个损坏/架构不符的文件
+//     装上去把自己弄死；
+//   - 需要二进制所在目录可写（`/usr/local/bin` 通常要 root；容器内默认 root 或改用
+//     compose 里的镜像更新）。
+package selfupdate
 
 import (
 	"archive/tar"
@@ -38,6 +38,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/atticus6/vultro-engine/internal/buildinfo"
 )
 
 // releaseRepo 发布仓库（与 install.sh / CI 一致）。
@@ -77,7 +79,7 @@ func SelfUpdate(ctx context.Context, targetVersion string, log *slog.Logger) err
 
 	asset := releaseAssetName(version, runtime.GOOS, runtime.GOARCH)
 	base := fmt.Sprintf("%s/%s/releases/download/%s", githubBase, releaseRepo, version)
-	log.Info("开始自更新", "from", Version, "to", version, "asset", asset)
+	log.Info("开始自更新", "from", buildinfo.Version, "to", version, "asset", asset)
 
 	client := &http.Client{Timeout: updateHTTPTimeout}
 

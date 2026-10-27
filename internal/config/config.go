@@ -1,8 +1,9 @@
-// 引擎配置：环境变量是唯一配置面（单二进制 + systemd/容器的部署形态）。
+// Package config 解析引擎的运行配置。
 //
-// 必需项缺失时启动即失败（Fail Fast）——带病运行的引擎比不运行更糟：
+// 环境变量是唯一配置面（单二进制 + systemd/容器的部署形态），见 README 的变量表。
+// 必需项缺失或取值非法时启动即失败（Fail Fast）——带病运行的引擎比不运行更糟：
 // 它会注册成可用节点，让 Worker 把任务派发给一个注定失败的地方。
-package main
+package config
 
 import (
 	"fmt"
@@ -11,13 +12,10 @@ import (
 	"strings"
 )
 
-// Version 引擎版本（注册/心跳上报；滚动升级时用于判断哪台还在跑旧版）。
-// 构建时可用 -ldflags 覆盖：go build -ldflags "-X main.Version=v1.0.1"。
-var Version = "dev"
-
-// Config 引擎运行配置（全部来自环境变量，见 README 的变量表）。
+// Config 引擎运行配置（全部来自环境变量）。
 type Config struct {
-	// ID 引擎 id（如 off1）：Worker 侧派发路由的键，必须稳定且唯一。
+	// ID 引擎 id（如 off1）：仅用于本地日志与运维对账，**不是身份**。
+	// 身份完全由令牌决定（见 Worker 侧注册/心跳契约）。
 	ID string
 
 	// PublicURL 引擎的公网地址。
@@ -61,8 +59,8 @@ type Config struct {
 	WarpIdentityPath string
 }
 
-// LoadConfig 从环境变量读取配置；必需项缺失返回错误。
-func LoadConfig() (*Config, error) {
+// Load 从环境变量读取配置；必需项缺失或取值非法时返回错误。
+func Load() (*Config, error) {
 	cfg := &Config{
 		ID:               os.Getenv("ENGINE_ID"),
 		PublicURL:        strings.TrimRight(os.Getenv("ENGINE_PUBLIC_URL"), "/"),
@@ -109,8 +107,8 @@ func LoadConfig() (*Config, error) {
 	return cfg, nil
 }
 
-// usesQuickTunnel 是否使用内嵌 cloudflared 临时隧道（未显式提供公网地址时）。
-func (c *Config) usesQuickTunnel() bool {
+// UsesQuickTunnel 是否使用内嵌 cloudflared 临时隧道（未显式提供公网地址时）。
+func (c *Config) UsesQuickTunnel() bool {
 	return c.PublicURL == ""
 }
 

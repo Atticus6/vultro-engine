@@ -4,8 +4,9 @@
 # - 裸机/VM 用户走 `install.sh`（不装 Docker，curl 一行装完）；
 # - 容器用户走 compose + GHCR 镜像（不用在容器里联网下载二进制）。
 #
-# 版本号注入：goreleaser 的 `-X main.Version={{.Version}}`，与 `config.go` 的 Version
-# 变量对应——注册/心跳上报给 Worker，滚动升级时用来判断哪台还在跑旧版。
+# 版本号注入：goreleaser 的 `-X .../internal/buildinfo.Version={{.Version}}`，与
+# `internal/buildinfo` 的 Version 变量对应——注册/心跳上报给 Worker，滚动升级时用来
+# 判断哪台还在跑旧版。
 name: release
 
 on:
