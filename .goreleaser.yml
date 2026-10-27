@@ -1,0 +1,47 @@
+# GoReleaser：交叉编译四个平台 + 归档 + 校验和。
+#
+# 资产命名固定为 `vultro-engine_<version>_<os>_<arch>.tar.gz`——`install.sh` 按这个名字
+# 拼 URL（而不是解析 GitHub API 的 JSON），两边必须同步改名。
+version: 2
+
+project_name: vultro-engine
+
+before:
+  hooks:
+    - go test ./...
+
+builds:
+  - id: engine
+    main: .
+    binary: vultro-engine
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X main.Version={{ .Version }}
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+      - docker-compose.yml
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  # 提交信息是中文、面向仓库维护者；按 commit 拼出来的 changelog 对使用者没有价值。
+  # 发布说明由 Release 页手工补一段"这次改了什么"。
+  disable: true
+
+release:
+  draft: false
+  prerelease: auto

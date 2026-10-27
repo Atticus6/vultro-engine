@@ -1,0 +1,35 @@
+# 引擎单容器部署（cloudflared 已内嵌到二进制里，**不再需要**单独的 cloudflared 容器）。
+#
+# 首次使用：
+#   1. 复制 `.env.example` 为 `.env` 并填值（ENGINE_TOKEN 与 Worker 的
+#      OFFLINE_ENGINE_TOKEN 同值）；
+#   2. `docker compose up -d` —— 引擎会自己开一条 `*.trycloudflare.com` 临时隧道，
+#      并把分配到的地址注册给 Worker（后台「离线节点」页能看到）。
+#
+# 网络要求：
+# - **出站** TCP 443（Cloudflare 边缘）与 TCP 7844（隧道，`TUNNEL_PROTOCOL=http2`）；
+# - `EGRESS_MODE=warp` 时还需要**出站 UDP 2408**（WARP 的 WireGuard 端口）。
+#   不需要任何入站端口/公网 IP。
+services:
+  engine:
+    image: ghcr.io/atticus6/vultro-engine:latest
+    restart: unless-stopped
+    environment:
+      ENGINE_ID: ${ENGINE_ID:-off1}
+      ENGINE_TOKEN: ${ENGINE_TOKEN:?请设置 ENGINE_TOKEN（与 Worker 的 OFFLINE_ENGINE_TOKEN 同值）}
+      WORKER_BASE_URL: ${WORKER_BASE_URL:?请设置 WORKER_BASE_URL（Worker 基址）}
+      ENGINE_CAPACITY: ${ENGINE_CAPACITY:-2}
+      ENGINE_ADDR: ":8787"
+      # 隧道协议：http2（TCP，最稳）/ quic（UDP，延迟更低但常被封）/ auto
+      TUNNEL_PROTOCOL: ${TUNNEL_PROTOCOL:-http2}
+      # 取源站出口：warp（源站只见 WARP IP）/ relay（经 Worker 转发）/ direct（暴露宿主 IP）
+      EGRESS_MODE: ${EGRESS_MODE:-warp}
+      WARP_IDENTITY_PATH: "/data/warp"
+      # 仅 direct 模式：http/https 上游代理
+      EGRESS_PROXY: ${EGRESS_PROXY:-}
+    volumes:
+      # WARP 身份跨重启复用：不持久化会每次启动都注册一台新设备（接口有频控）。
+      - warp-identity:/data/warp
+
+volumes:
+  warp-identity:
