@@ -46,30 +46,39 @@ curl -fsSL https://raw.githubusercontent.com/atticus6/vultro-engine/main/install
 ```sh
 git clone https://github.com/atticus6/vultro-engine.git
 cd vultro-engine
-cp .env.example .env      # 只需填 ENGINE_TOKEN；其余有默认值
+cp .env.example .env      # 填 ENGINE_TOKEN（后台创建节点时给出的一次性令牌）；其余有默认值
 docker compose up -d
 ```
 
 **只有一个容器**：cloudflared 已内嵌，引擎自己开临时隧道并上报地址——不需要创建
 tunnel、不需要配 DNS、不需要公网 IP。启动后到后台「离线节点」页确认该节点变成「在线」。
 
+### 令牌从哪来（每节点一枚）
+
+后台「离线下载节点」页 → **添加节点**（填 id 与槽位）→ 页面给出该节点的 `eng_…` 令牌与
+填好的启动片段。**令牌只显示那一次**：丢了就到该行点「重置令牌」，把新令牌写进
+`ENGINE_TOKEN` 并重启引擎。
+
+没有全局共享的引擎 secret——每台机器一枚，一台泄露不影响其它节点；重置只吊销那一台
+（旧令牌立即失效）。
+
 需要放行的**出站**端口：TCP 443（Cloudflare 边缘）、TCP 7844（隧道，HTTP/2）；
 `EGRESS_MODE=warp` 还需要 UDP 2408（WARP）。**不需要任何入站端口。**
 
 ## 环境变量
 
-| 变量                | 必填 | 说明                                                        |
-| ------------------- | ---- | ----------------------------------------------------------- |
-| `ENGINE_ID`         | ✅   | 引擎 id（如 `off1`），与隧道主机名对应，Worker 侧派发路由键 |
-| `ENGINE_PUBLIC_URL` | ✅   | 隧道公网地址；Worker 向它 `POST /v1/tasks`                  |
-| `ENGINE_TOKEN`      | ✅   | 与 Worker 的 `OFFLINE_ENGINE_TOKEN` 同值（双向 Bearer）     |
-| `WORKER_BASE_URL`   | ✅   | Worker 基址（测试/生产各自的域名）                          |
-| `ENGINE_CAPACITY`   |      | 并发槽位（默认 2，1–16；每槽约 64 MiB 内存）                |
-| `ENGINE_ADDR`       |      | 本地监听（默认 `:8787`）                                    |
-| `EGRESS_MODE`       |      | `relay`（默认，源站流量经 Worker 出口）/ `direct`           |
-| `EGRESS_PROXY`      |      | 仅 direct：http/https 上游代理（socks5 不支持）             |
+| 变量                | 必填 | 说明                                                             |
+| ------------------- | ---- | ---------------------------------------------------------------- |
+| `ENGINE_ID`         | ✅   | 引擎 id（如 `off1`），仅用于本地日志与运维对账（身份由令牌决定） |
+| `ENGINE_TOKEN`      | ✅   | 该节点专属的 `eng_…`（双向 Bearer；后台创建/重置节点时给出）     |
+| `WORKER_BASE_URL`   | ✅   | Worker 基址（测试/生产各自的域名）                               |
+| `ENGINE_PUBLIC_URL` |      | 留空 = 内嵌临时隧道并自动上报；填了则用外部隧道（不再内嵌）      |
+| `ENGINE_CAPACITY`   |      | 并发槽位（默认 2，1–16；每槽约 64 MiB 内存）                     |
+| `ENGINE_ADDR`       |      | 本地监听（默认 `:8787`）                                         |
+| `EGRESS_MODE`       |      | `relay`（默认）/ `warp` / `direct`                               |
+| `EGRESS_PROXY`      |      | 仅 direct：http/https 上游代理（socks5 不支持）                  |
 
-## 入站端点（Worker → 引擎，Bearer 引擎令牌）
+## 入站端点（Worker → 引擎，Bearer 该节点令牌）
 
 | 方法 | 路径                    | 说明                                      |
 | ---- | ----------------------- | ----------------------------------------- |
@@ -109,6 +118,7 @@ tunnel、不需要配 DNS、不需要公网 IP。启动后到后台「离线节�
   是让镜像 tag 跟随版本、交给编排更新；
 - 也可手动触发：`curl -X POST -H "authorization: Bearer $ENGINE_TOKEN" \
 -d '{"version":"v1.0.0"}' http://127.0.0.1:8787/v1/update`（留空版本 = 最新）。
+  `$ENGINE_TOKEN` 是**本节点**的令牌（`eng_…`），不是任何全局 secret。
 
 ## 已知限制（重要）
 

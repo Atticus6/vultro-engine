@@ -98,10 +98,13 @@ type PermanentError struct{ Msg string }
 
 func (e *PermanentError) Error() string { return e.Msg }
 
-// Register 引擎注册（幂等 upsert）。启动时一次；Worker 侧同 id 覆盖更新。
+// Register 引擎注册（幂等更新自己那一行）。启动时一次。
+//
+// **不发送 id**：身份完全由令牌决定——Worker 按 `Authorization` 里的 `eng_…` 反查节点行。
+// 请求体里再带一个 id 会让"我是谁"出现两个来源（而其中一个可以随便填）。引擎 id 仍留在
+// 本地配置里，因为日志与运维对账要用它显示。
 func (w *WorkerClient) Register(ctx context.Context, cfg *Config) error {
 	return w.do(ctx, http.MethodPost, "/api/offline/engines/register", map[string]any{
-		"id":        cfg.ID,
 		"publicUrl": cfg.PublicURL,
 		"capacity":  cfg.Capacity,
 		"version":   Version,
@@ -109,6 +112,9 @@ func (w *WorkerClient) Register(ctx context.Context, cfg *Config) error {
 }
 
 // Heartbeat 心跳：刷新 lastSeenAt、上报版本与排水状态；返回 dispatchHint。
+//
+// **不发送 x-engine-id**：节点身份同样只来自令牌。旧实现用这个头告诉 Worker "我是哪台"，
+// 那意味着持有令牌的人能替别的节点报活——共享令牌时代尤其致命。
 //
 // 上报 `draining` 是关键：Worker 据此把本节点从派发候选里排除——否则排空期间
 // 新任务还会被派过来（引擎虽然会 503，但那要多一次往返且任务要重新排队）。
@@ -130,7 +136,6 @@ func (w *WorkerClient) Heartbeat(ctx context.Context, engineID, version string, 
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+w.token)
-	req.Header.Set("X-Engine-Id", engineID)
 	resp, err := w.http.Do(req)
 	if err != nil {
 		return false, err
@@ -142,6 +147,8 @@ func (w *WorkerClient) Heartbeat(ctx context.Context, engineID, version string, 
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return false, err
 	}
+	// engineID 只用于调用方日志；身份已经由令牌表达，不再上网。
+	_ = engineID
 	return out.DispatchHint, nil
 }
 

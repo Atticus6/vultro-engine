@@ -31,8 +31,10 @@ type Config struct {
 	// `quic`（UDP 7844，延迟更好但被不少机房/网络封）或 `auto`（先 quic 再回落）。
 	TunnelProtocol string
 
-	// Token 引擎令牌（与 Worker 的 OFFLINE_ENGINE_TOKEN 同值）。
+	// Token 该节点**专属**的引擎令牌（`eng_…`）。
 	// 双向 Bearer：引擎调 Worker 的内部端点、Worker 派发到引擎，都用它。
+	// 由管理员在后台「离线下载节点」页创建/重置节点时生成——每台机器一枚，
+	// 没有全局共享 secret（一台泄露不影响其它节点）。
 	Token string
 
 	// WorkerBaseURL Worker 基址（生产/测试各自的域名；本地联调 http://localhost:8787）。

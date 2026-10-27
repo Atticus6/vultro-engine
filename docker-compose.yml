@@ -1,9 +1,9 @@
 # 引擎单容器部署（cloudflared 已内嵌到二进制里，**不再需要**单独的 cloudflared 容器）。
 #
 # 首次使用：
-#   1. 复制 `.env.example` 为 `.env` 并填值（ENGINE_TOKEN 与 Worker 的
-#      OFFLINE_ENGINE_TOKEN 同值）；
-#   2. `docker compose up -d` —— 引擎会自己开一条 `*.trycloudflare.com` 临时隧道，
+#   1. 后台「离线下载节点」页新建节点，复制它给出的一次性令牌（eng_…）；
+#   2. 复制 `.env.example` 为 `.env`，把令牌填进 ENGINE_TOKEN；
+#   3. `docker compose up -d` —— 引擎会自己开一条 `*.trycloudflare.com` 临时隧道，
 #      并把分配到的地址注册给 Worker（后台「离线节点」页能看到）。
 #
 # 网络要求：
@@ -16,7 +16,7 @@ services:
     restart: unless-stopped
     environment:
       ENGINE_ID: ${ENGINE_ID:-off1}
-      ENGINE_TOKEN: ${ENGINE_TOKEN:?请设置 ENGINE_TOKEN（与 Worker 的 OFFLINE_ENGINE_TOKEN 同值）}
+      ENGINE_TOKEN: ${ENGINE_TOKEN:?请设置 ENGINE_TOKEN（后台创建节点时给出的该节点令牌 eng_…）}
       WORKER_BASE_URL: ${WORKER_BASE_URL:?请设置 WORKER_BASE_URL（Worker 基址）}
       ENGINE_CAPACITY: ${ENGINE_CAPACITY:-2}
       ENGINE_ADDR: ":8787"
