@@ -1,30 +1,85 @@
-# Release 流水线：打 `v*` 标签即发布引擎二进制 + 多架构镜像。
+# Release 流水线：`main` 一有改动就发一版，不需要手工打标签。
 #
-# 为什么二进制与镜像都要发：
-# - 裸机/VM 用户走 `install.sh`（不装 Docker，curl 一行装完）；
-# - 容器用户走 compose + GHCR 镜像（不用在容器里联网下载二进制）。
+# 每次推送依次执行：
+#   1. prepare：读 `version.md`，补丁位 +1，回写并推送，随后在回写提交上打 `v<版本>` 标签；
+#   2. binaries：在**新标签**上跑 GoReleaser（四平台归档 + checksums.txt）；
+#   3. image：在**新标签**上构建推送多架构镜像。
 #
-# 版本号注入：goreleaser 的 `-X .../internal/buildinfo.Version={{.Version}}`，与
-# `internal/buildinfo` 的 Version 变量对应——注册/心跳上报给 Worker，滚动升级时用来
-# 判断哪台还在跑旧版。
+# 两个必须注意的点：
+# - `paths-ignore: version.md`：版本回写提交只改这一个文件，不能再触发一次发布（否则每次
+#   发布都会连锁多跑一轮）。回写提交用的是 GITHUB_TOKEN，按 GitHub 规则本身也不会触发
+#   新工作流，这里加过滤是双保险。
+# - 后两个 job 相互隔离，必须显式 checkout 新标签：用默认的事件 SHA 会编译"改动前"的
+#   代码，却贴上"改动后"的版本号。
 name: release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
+    paths-ignore:
+      - version.md
   workflow_dispatch:
 
 permissions:
   contents: write
   packages: write
 
+# 串行发布：并发推送时，后一次必须基于前一次回写后的 version.md 再 +1，不能并行算版本。
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      # 形如 v1.0.1（带 v 前缀，与 GoReleaser / install.sh 的约定一致）。
+      version: ${{ steps.bump.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: 版本 +1 并打标签
+        id: bump
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 队列中的后续发布必须基于最新 main 的 version.md，否则两次运行会算出同一个版本。
+          git pull --rebase origin main
+
+          current=$(grep -oE '^[0-9]+\.[0-9]+\.[0-9]+$' version.md | head -1)
+          if [ -z "$current" ]; then
+            echo "::error::version.md 里没有独占一行的版本号（形如 1.0.0）"
+            exit 1
+          fi
+          IFS=. read -r major minor patch <<<"$current"
+          next="$major.$minor.$((patch + 1))"
+
+          # 不用 `sed -i`：BSD 与 GNU 的 -i 参数语义不同（mac 上会静默不改 / 生成备份文件），
+          # 写临时文件再 mv 两边行为一致。
+          sed -E "s/^[0-9]+\.[0-9]+\.[0-9]+$/$next/" version.md > version.md.new
+          mv version.md.new version.md
+          git add version.md
+          git commit -m "chore(release): v$next"
+          git tag "v$next"
+          git push origin main
+          git push origin "v$next"
+
+          echo "version=v$next" >> "$GITHUB_OUTPUT"
+          echo "本次发布：v$next" >> "$GITHUB_STEP_SUMMARY"
+
   binaries:
+    needs: prepare
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.prepare.outputs.version }}
           fetch-depth: 0
 
       - uses: actions/setup-go@v5
@@ -32,9 +87,7 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: test
-        run: go test ./...
-
+      # `go test ./...` 由 .goreleaser.yml 的 before.hooks 保证，这里不重复跑。
       - uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser
@@ -44,9 +97,12 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   image:
+    needs: prepare
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.version }}
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
@@ -57,14 +113,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # metadata-action 会把仓库名转成小写（GHCR 要求），标签用 prepare 算出的版本。
       - name: meta
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ needs.prepare.outputs.version }}
             type=raw,value=latest
 
       - uses: docker/build-push-action@v6
@@ -75,4 +131,4 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            VERSION=${{ github.ref_name }}
+            VERSION=${{ needs.prepare.outputs.version }}

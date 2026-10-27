@@ -156,19 +156,21 @@ go build -o vultro-engine . && go test ./...
 
 ## 发布
 
-打 `v*` 标签触发 GitHub Actions（`.github/workflows/release.yml`）：
+推送到 `main` 即自动发布（`.github/workflows/release.yml`），**不需要手工打标签**：
 
-- 四个平台（linux/darwin × amd64/arm64）的归档 + `checksums.txt`（GoReleaser）；
-- 多架构镜像 `ghcr.io/atticus6/vultro-engine:latest` 与 `:<version>`。
+1. 读取 `version.md` 的版本号，把补丁位 +1（1.0.0 → 1.0.1），回写并推送到 `main`；
+2. 在回写提交上打 `v<版本>` 标签；
+3. GoReleaser 产出四平台（linux/darwin × amd64/arm64）归档 + `checksums.txt`，
+   并构建推送镜像 `ghcr.io/atticus6/vultro-engine:<版本>` 与 `:latest`。
 
-```sh
-git tag v1.0.0 && git push origin v1.0.0
-```
+`version.md` 记录的是**最近一次发布的版本**；要跳大版本 / 小版本时手工改它，
+下一次发布从新值继续 +1。版本回写提交只改 `version.md`，不会再次触发发布。
 
 ## 从主仓（monorepo）同步
 
-本目录是独立仓库的源：主仓里改动后，用 `git subtree` 推过去：
+主仓把本目录作为 **git submodule** 引用（跟踪 `main`）。引擎改动要**两步**：
 
-```sh
-git subtree push --prefix apps/engine git@github.com:atticus6/vultro-engine.git main
-```
+1. 在本目录提交并 `git push`；
+2. 回主仓 `git add apps/engine` 提交新的指针。
+
+只改子仓不推、或只提交指针不推子仓，都会让别人的检出拿到旧代码 / 悬空指针。
