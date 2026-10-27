@@ -1,8 +1,12 @@
-// Package config 解析引擎的运行配置。
+// 配置解析：**命令行参数 > 环境变量 > 配置文件**，三级依次回退。
 //
-// 环境变量是唯一配置面（单二进制 + systemd/容器的部署形态），见 README 的变量表。
-// 必需项缺失或取值非法时启动即失败（Fail Fast）——带病运行的引擎比不运行更糟：
-// 它会注册成可用节点，让 Worker 把任务派发给一个注定失败的地方。
+// 环境变量与配置文件同名同义（见 README 的变量表）；命令行参数是它们的
+// 短名字（`--engine-id` / `--token` / …），只覆盖对应的那一项。
+//
+// 为什么是这个优先级：命令行最"显式"（只影响这一次启动，调试/临时接管用），
+// 环境变量次之（容器与 systemd 的常规形态），文件最弱（落盘的默认值，install.sh
+// 会写一份）。这样 `vultro-engine --token=xxx` 能临时盖掉文件里的旧令牌，而不用
+// 去改文件。
 package config
 
 import (
@@ -12,7 +16,7 @@ import (
 	"strings"
 )
 
-// Config 引擎运行配置（全部来自环境变量）。
+// Config 引擎运行配置（来源见包注释的优先级）。
 type Config struct {
 	// ID 引擎 id（如 off1）：仅用于本地日志与运维对账，**不是身份**。
 	// 身份完全由令牌决定（见 Worker 侧注册/心跳契约）。
@@ -57,20 +61,88 @@ type Config struct {
 	//
 	// 复用同一身份避免每次重启都向 Cloudflare 注册新设备（有频控）。容器里应挂 volume。
 	WarpIdentityPath string
+
+	// ConfigFile 本次实际读取的配置文件路径（空 = 没有读到任何文件）。
+	// 只用于启动日志与 `--print-config`，不参与业务。
+	ConfigFile string
 }
 
-// Load 从环境变量读取配置；必需项缺失或取值非法时返回错误。
+// Options 命令行参数（零值 = 未指定，此时回退到环境变量 / 文件）。
+type Options struct {
+	// ConfigFile `--config`：显式指定配置文件。
+	ConfigFile string
+
+	ID               string
+	Token            string
+	WorkerBaseURL    string
+	PublicURL        string
+	Addr             string
+	Capacity         string
+	EgressMode       string
+	EgressProxy      string
+	TunnelProtocol   string
+	WarpIdentityPath string
+}
+
+// Load 用默认参数（仅环境变量 + 配置文件）加载配置。
 func Load() (*Config, error) {
+	return LoadWithOptions(Options{})
+}
+
+// LoadWithOptions 按 `命令行 > 环境变量 > 配置文件` 解析配置。
+//
+// 必需项缺失或取值非法时返回错误（Fail Fast）——带病运行的引擎比不运行更糟：
+// 它会注册成可用节点，让 Worker 把任务派发给一个注定失败的地方。
+func LoadWithOptions(opts Options) (*Config, error) {
+	filePath := opts.ConfigFile
+	if filePath == "" {
+		filePath = envDefault("ENGINE_CONFIG_FILE", defaultConfigPath())
+	}
+
+	fromFile := map[string]string{}
+	configFile := ""
+	if filePath != "" {
+		values, err := parseConfigFile(filePath)
+		switch {
+		case err == nil:
+			fromFile = values
+			configFile = filePath
+		case os.IsNotExist(err):
+			// 默认路径下没有文件是正常的（纯环境变量部署）；但**显式指定**的文件
+			// 不存在要报错，否则 `--config` 拼错会静默跑在默认值上。
+			if opts.ConfigFile != "" || os.Getenv("ENGINE_CONFIG_FILE") != "" {
+				return nil, fmt.Errorf("配置文件 %s 不存在", filePath)
+			}
+		default:
+			return nil, fmt.Errorf("读取配置文件 %s 失败：%w", filePath, err)
+		}
+	}
+
+	// 三级取值：命令行 → 环境变量 → 文件 → 内置默认。
+	pick := func(flagValue, envKey, fallback string) string {
+		if flagValue != "" {
+			return flagValue
+		}
+		if value := os.Getenv(envKey); value != "" {
+			return value
+		}
+		if value := fromFile[envKey]; value != "" {
+			return value
+		}
+		return fallback
+	}
+
 	cfg := &Config{
-		ID:               os.Getenv("ENGINE_ID"),
-		PublicURL:        strings.TrimRight(os.Getenv("ENGINE_PUBLIC_URL"), "/"),
-		TunnelProtocol:   strings.ToLower(envDefault("TUNNEL_PROTOCOL", "http2")),
-		Token:            os.Getenv("ENGINE_TOKEN"),
-		WorkerBaseURL:    strings.TrimRight(os.Getenv("WORKER_BASE_URL"), "/"),
-		Addr:             envDefault("ENGINE_ADDR", ":8787"),
-		EgressMode:       strings.ToLower(envDefault("EGRESS_MODE", "relay")),
-		EgressProxy:      os.Getenv("EGRESS_PROXY"),
-		WarpIdentityPath: envDefault("WARP_IDENTITY_PATH", "./warp-identity"),
+		ID:               pick(opts.ID, "ENGINE_ID", ""),
+		PublicURL:        strings.TrimRight(pick(opts.PublicURL, "ENGINE_PUBLIC_URL", ""), "/"),
+		TunnelProtocol:   strings.ToLower(pick(opts.TunnelProtocol, "TUNNEL_PROTOCOL", "http2")),
+		Token:            pick(opts.Token, "ENGINE_TOKEN", ""),
+		WorkerBaseURL:    strings.TrimRight(pick(opts.WorkerBaseURL, "WORKER_BASE_URL", ""), "/"),
+		Addr:             pick(opts.Addr, "ENGINE_ADDR", ":8787"),
+		EgressMode:       strings.ToLower(pick(opts.EgressMode, "EGRESS_MODE", "relay")),
+		EgressProxy:      pick(opts.EgressProxy, "EGRESS_PROXY", ""),
+		WarpIdentityPath: pick(opts.WarpIdentityPath, "WARP_IDENTITY_PATH", "./warp-identity"),
+		ConfigFile:       configFile,
 	}
 
 	for name, value := range map[string]string{
@@ -79,7 +151,7 @@ func Load() (*Config, error) {
 		"WORKER_BASE_URL": cfg.WorkerBaseURL,
 	} {
 		if value == "" {
-			return nil, fmt.Errorf("缺少必需环境变量 %s", name)
+			return nil, fmt.Errorf("缺少必需配置 %s（命令行参数 / 环境变量 / 配置文件 %s 都没有）", name, displayPath(filePath))
 		}
 	}
 
@@ -95,11 +167,12 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("EGRESS_MODE 只支持 relay / warp / direct，得到 %q", cfg.EgressMode)
 	}
 
+	capacityRaw := pick(opts.Capacity, "ENGINE_CAPACITY", "")
 	cfg.Capacity = 2
-	if raw := os.Getenv("ENGINE_CAPACITY"); raw != "" {
-		n, err := strconv.Atoi(raw)
+	if capacityRaw != "" {
+		n, err := strconv.Atoi(capacityRaw)
 		if err != nil || n < 1 || n > 16 {
-			return nil, fmt.Errorf("ENGINE_CAPACITY 必须是 1-16 的整数，得到 %q", raw)
+			return nil, fmt.Errorf("ENGINE_CAPACITY 必须是 1-16 的整数，得到 %q", capacityRaw)
 		}
 		cfg.Capacity = n
 	}
@@ -117,4 +190,12 @@ func envDefault(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// displayPath 报错时用的路径文案（空值说明"没有默认路径"）。
+func displayPath(path string) string {
+	if path == "" {
+		return "（无默认路径）"
+	}
+	return path
 }

@@ -1,7 +1,7 @@
 // 引擎进程入口：只做装配，不含业务逻辑。
 //
 // 启动顺序（每一步失败都直接退出——带病运行比不运行更糟：它会注册成可用节点）：
-//  1. 解析配置（环境变量，见 internal/config）；
+//  1. 解析参数与配置（**命令行 > 环境变量 > 配置文件**，见 internal/config）；
 //  2. 起本地 HTTP 服务（入站只经隧道，不监听公网，见 internal/server）；
 //  3. 解析公网地址：显式配置 或 内嵌 cloudflared 临时隧道（见 internal/tunnel）；
 //  4. 注册到 Worker（幂等，失败重试）；
@@ -28,22 +28,40 @@ import (
 )
 
 func main() {
-	// `--version` 必须在读配置之前处理：自更新会用 `新二进制 --version` 做冒烟检查，
-	// 这一步不能因为缺环境变量而失败。
+	// `--version` / `--help` 必须在读配置之前处理：自更新会用 `新二进制 --version`
+	// 做冒烟检查，这一步不能因为缺配置而失败。
 	for _, arg := range os.Args[1:] {
-		if arg == "--version" || arg == "-version" || arg == "-v" {
+		switch arg {
+		case "--version", "-version", "-v":
 			fmt.Println(buildinfo.Version)
 			return
 		}
 	}
 
+	args, err := parseArgs(os.Args[1:])
+	if err != nil {
+		exitWithUsageError(err)
+	}
+	if args.showHelp {
+		fmt.Print(usage)
+		return
+	}
+
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
-	cfg, err := config.Load()
+	cfg, err := config.LoadWithOptions(args.options)
 	if err != nil {
 		logger.Error("配置加载失败", "err", err)
 		os.Exit(1)
+	}
+
+	if args.printConfig {
+		printConfig(cfg)
+		return
+	}
+	if cfg.ConfigFile != "" {
+		logger.Info("已读取配置文件", "path", cfg.ConfigFile)
 	}
 
 	// ── 1) 先起本地服务：隧道要指向它 ─────────────────────────────────────────

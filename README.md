@@ -65,7 +65,26 @@ tunnel、不需要配 DNS、不需要公网 IP。启动后到后台「离线节�
 需要放行的**出站**端口：TCP 443（Cloudflare 边缘）、TCP 7844（隧道，HTTP/2）；
 `EGRESS_MODE=warp` 还需要 UDP 2408（WARP）。**不需要任何入站端口。**
 
-## 环境变量
+## 配置：命令行 > 环境变量 > 配置文件
+
+三项来源**同名同义**，按上面的优先级依次回退：命令行最显式（只影响这一次启动），
+环境变量次之（容器与 systemd 的常规形态），配置文件最弱（install.sh 会写一份落盘默认值）。
+
+```sh
+# 1) 配置文件（默认 ~/.config/vultro-engine/config，可用 --config 或 ENGINE_CONFIG_FILE 改）
+vultro-engine --engine-id off1 --token eng_… --worker-url https://example.com
+# ↑ 这样跑会先读文件，再被命令行覆盖
+
+# 2) 只写文件不启动：install.sh 的参数就是写进这个文件
+curl -fsSL https://raw.githubusercontent.com/atticus6/vultro-engine/main/install.sh \
+  | sh -s -- --engine-id off1 --token eng_… --worker-url https://example.com
+
+# 3) 看当前生效的值（令牌打码）与它来自哪个文件
+vultro-engine --print-config
+```
+
+配置文件是 `KEY=VALUE` 行（支持 `#` 注释、`export ` 前缀与成对引号），因此也能被
+`source` 或 systemd 的 `EnvironmentFile=` 直接使用。未知键会报错而不是静默忽略。
 
 | 变量                | 必填 | 说明                                                             |
 | ------------------- | ---- | ---------------------------------------------------------------- |
@@ -77,6 +96,13 @@ tunnel、不需要配 DNS、不需要公网 IP。启动后到后台「离线节�
 | `ENGINE_ADDR`       |      | 本地监听（默认 `:8787`）                                         |
 | `EGRESS_MODE`       |      | `relay`（默认）/ `warp` / `direct`                               |
 | `EGRESS_PROXY`      |      | 仅 direct：http/https 上游代理（socks5 不支持）                  |
+| `TUNNEL_PROTOCOL`   |      | `http2`（默认）/ `quic` / `auto`                                 |
+| `WARP_IDENTITY_PATH`|      | WARP 身份目录（默认 `./warp-identity`）                          |
+| `ENGINE_CONFIG_FILE`|      | 配置文件路径（默认见上；命令行 `--config` 优先）                 |
+
+对应的命令行参数：`--engine-id` `--token` `--worker-url` `--public-url` `--addr`
+`--capacity` `--egress` `--egress-proxy` `--tunnel-protocol` `--warp-identity`
+`--config` `--print-config`；完整说明见 `vultro-engine --help`。
 
 ## 入站端点（Worker → 引擎，Bearer 该节点令牌）
 
