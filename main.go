@@ -23,6 +23,7 @@ import (
 	"github.com/atticus6/vultro-engine/internal/download"
 	"github.com/atticus6/vultro-engine/internal/egress"
 	"github.com/atticus6/vultro-engine/internal/server"
+	"github.com/atticus6/vultro-engine/internal/stats"
 	"github.com/atticus6/vultro-engine/internal/tunnel"
 	"github.com/atticus6/vultro-engine/internal/worker"
 )
@@ -65,8 +66,12 @@ func main() {
 	}
 
 	// ── 1) 先起本地服务：隧道要指向它 ─────────────────────────────────────────
-	workerClient := worker.NewClient(cfg.WorkerBaseURL, cfg.Token, nil, logger)
+	// 进程级计数器：内存由运行时直接读，流量由下载循环的包装 reader 累加，心跳每 30s
+	// 把累计值 + 本进程启动时间报给 Worker（按日求和、处理重启都在 Worker 侧）。
+	// 在装配的最早期创建：启动时间越接近进程起点，Worker 侧的重启识别越准。
+	counters := stats.New()
 
+	workerClient := worker.NewClient(cfg.WorkerBaseURL, cfg.Token, nil, logger)
 	sourceClient, closeEgress, err := egress.New(cfg, logger)
 	if err != nil {
 		logger.Error("出口初始化失败（拒绝以会暴露宿主机 IP 的方式启动）", "err", err)
@@ -74,7 +79,7 @@ func main() {
 	}
 	defer closeEgress()
 
-	runner := download.NewRunner(workerClient, sourceClient, cfg.EgressMode, logger)
+	runner := download.NewRunner(workerClient, sourceClient, cfg.EgressMode, counters, logger)
 	srv := server.New(cfg, runner, logger)
 	httpServer := &http.Server{Addr: cfg.Addr, Handler: srv.Handler()}
 	go func() {
@@ -121,8 +126,18 @@ func main() {
 	// ── 4) 心跳：刷新 lastSeenAt；Worker 有排队任务时会立即扫一轮派发 ─────────
 	go func() {
 		for {
+			// 每轮现取一次指标：流量是累计值，内存是此刻的快照。
+			traffic := counters.Snapshot()
+			memory := stats.ReadMemory()
 			hbCtx, hbCancel := context.WithTimeout(ctx, 15*time.Second)
-			hint, err := workerClient.Heartbeat(hbCtx, srv.Draining())
+			hint, err := workerClient.Heartbeat(hbCtx, worker.HeartbeatReport{
+				Draining:     srv.Draining(),
+				MemHeapBytes: memory.HeapBytes,
+				MemSysBytes:  memory.SysBytes,
+				RxBytes:      traffic.RxBytes,
+				TxBytes:      traffic.TxBytes,
+				StartedAtMs:  traffic.StartedAtMs,
+			})
 			hbCancel()
 			if err != nil {
 				logger.Warn("心跳失败", "err", err)

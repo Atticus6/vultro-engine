@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/atticus6/vultro-engine/internal/stats"
 	"github.com/atticus6/vultro-engine/internal/worker"
 )
 
@@ -29,6 +30,9 @@ type Runner struct {
 	// relay），真正能不能直连/走 WARP 取决于这台机器的网络条件——那只有引擎自己知道。
 	egressMode string
 
+	// counters 进程级流量计数（心跳上报给 Worker）。nil = 不统计（单测构造时留空）。
+	counters *stats.Counters
+
 	// 进度回报的最小间隔（节流 D1 写入）。
 	progressInterval time.Duration
 
@@ -37,11 +41,20 @@ type Runner struct {
 }
 
 // NewRunner 构造执行器。
-func NewRunner(client *worker.Client, source *http.Client, egressMode string, log *slog.Logger) *Runner {
+//
+// counters 为 nil 时不统计流量（单测直接构造 Runner 的场景）；生产恒有值，见 main.go。
+func NewRunner(
+	client *worker.Client,
+	source *http.Client,
+	egressMode string,
+	counters *stats.Counters,
+	log *slog.Logger,
+) *Runner {
 	return &Runner{
 		client:           client,
 		source:           source,
 		egressMode:       egressMode,
+		counters:         counters,
 		log:              log,
 		progressInterval: time.Second,
 		cancels:          newCancelRegistry(),
@@ -157,7 +170,9 @@ func (r *Runner) runParts(ctx context.Context, parentCtx context.Context, task T
 			return err
 		}
 		defer body.Close()
-		if err := r.client.UploadSingle(ctx, task.TaskToken, task.Session.ID, task.Session.Size, body); err != nil {
+		if err := r.client.UploadSingle(
+			ctx, task.TaskToken, task.Session.ID, task.Session.Size, r.txReader(body),
+		); err != nil {
 			return err
 		}
 		_ = r.client.ReportProgress(ctx, task.TaskToken, task.TaskID, task.Session.Size)
@@ -201,7 +216,9 @@ func (r *Runner) runParts(ctx context.Context, parentCtx context.Context, task T
 				}
 				continue
 			}
-			err = r.client.UploadPart(ctx, task.TaskToken, task.Session.ID, part, length, body)
+			err = r.client.UploadPart(
+				ctx, task.TaskToken, task.Session.ID, part, length, r.txReader(body),
+			)
 			_ = body.Close()
 			if err == nil {
 				downloaded += length
@@ -232,6 +249,9 @@ func (r *Runner) runParts(ctx context.Context, parentCtx context.Context, task T
 }
 
 // fetchRange 取源站的一段字节。relay 走 Worker 的 fetch 端点；warp/direct 由引擎出网。
+//
+// 回来的 body 已经套上**下行计数**：按实际读出的字节记账（不是分片长度）——失败重试的
+// 那一片同样占了带宽，按声明长度算会少记。
 func (r *Runner) fetchRange(ctx context.Context, task Task, rangeHeader string) (io.ReadCloser, error) {
 	if r.egressMode != "relay" {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, task.Source.URL, nil)
@@ -248,7 +268,7 @@ func (r *Runner) fetchRange(ctx context.Context, task Task, rangeHeader string) 
 			resp.Body.Close()
 			return nil, fmt.Errorf("源站返回 HTTP %d", resp.StatusCode)
 		}
-		return resp.Body, nil
+		return r.rxReader(resp.Body), nil
 	}
 
 	// relay：经 Worker 出口（url 精确匹配白名单在 Worker 侧校验）。
@@ -264,7 +284,26 @@ func (r *Runner) fetchRange(ctx context.Context, task Task, rangeHeader string) 
 		resp.Body.Close()
 		return nil, fmt.Errorf("relay 取流 HTTP %d", resp.StatusCode)
 	}
-	return resp.Body, nil
+	return r.rxReader(resp.Body), nil
+}
+
+// rxReader 给源站响应体套下行计数；没有计数器时原样返回（单测构造）。
+func (r *Runner) rxReader(body io.ReadCloser) io.ReadCloser {
+	if r.counters == nil {
+		return body
+	}
+	return r.counters.RxReader(body)
+}
+
+// txReader 给上传请求体套上行计数；没有计数器时原样返回。
+//
+// 计的是 HTTP 客户端**实际读出**的字节：中途失败的那次上传也被读了一部分，那同样是
+// 真实流量，按"成功分片数 × 片长"统计会漏掉它们。
+func (r *Runner) txReader(body io.Reader) io.Reader {
+	if r.counters == nil {
+		return body
+	}
+	return r.counters.TxReader(body)
 }
 
 // finish 交还结果（失败只记录，不 panic）。

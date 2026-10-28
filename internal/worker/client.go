@@ -114,20 +114,48 @@ func (c *Client) Register(ctx context.Context, publicURL string, capacity int) e
 	}, nil, c.token)
 }
 
-// Heartbeat 心跳：刷新 lastSeenAt、上报版本与排水状态；返回 dispatchHint。
+// HeartbeatReport 一次心跳要上报的节点状态。
+//
+// 除了排水标记，还带**内存**与**累计流量**：这三样只有引擎自己知道，Worker 只能从心跳
+// 里拿到。累计流量是"自本进程启动起"的单调值，配合 StartedAtMs 让 Worker 能识别进程
+// 重启——否则重启会让差值变负（被吞掉），或者把重启前的那段账永远算不回来。
+type HeartbeatReport struct {
+	// Draining 是否正在排空（升级窗口）。Worker 据此把本节点排除出派发候选。
+	Draining bool
+	// MemHeapBytes Go 堆在用字节数（"当前内存占用"的主数字）。
+	MemHeapBytes uint64
+	// MemSysBytes 运行时向操作系统取得的字节数（更接近容器 RSS 的口径）。
+	MemSysBytes uint64
+	// RxBytes 下行累计字节（自 StartedAtMs 起）。
+	RxBytes int64
+	// TxBytes 上行累计字节（自 StartedAtMs 起）。
+	TxBytes int64
+	// StartedAtMs 本进程启动时刻（Unix 毫秒）：累计值的归属凭据。
+	StartedAtMs int64
+}
+
+// Heartbeat 心跳：刷新 lastSeenAt、上报版本/排水状态/内存/累计流量；返回 dispatchHint。
 //
 // **不发送 x-engine-id**：节点身份同样只来自令牌。旧实现用这个头告诉 Worker "我是哪台"，
 // 那意味着持有令牌的人能替别的节点报活——共享令牌时代尤其致命。
 //
 // 上报 `draining` 是关键：Worker 据此把本节点从派发候选里排除——否则排空期间
 // 新任务还会被派过来（引擎虽然会 503，但那要多一次往返且任务要重新排队）。
-func (c *Client) Heartbeat(ctx context.Context, draining bool) (bool, error) {
+//
+// 指标字段是**追加**的：老 Worker 不认识会忽略，新 Worker 收到没带指标的心跳（老引擎）
+// 也照常工作——两侧可以各自独立升级。
+func (c *Client) Heartbeat(ctx context.Context, report HeartbeatReport) (bool, error) {
 	var out struct {
 		DispatchHint bool `json:"dispatchHint"`
 	}
 	body, err := json.Marshal(map[string]any{
-		"version":  buildinfo.Version,
-		"draining": draining,
+		"version":      buildinfo.Version,
+		"draining":     report.Draining,
+		"memHeapBytes": report.MemHeapBytes,
+		"memSysBytes":  report.MemSysBytes,
+		"rxBytes":      report.RxBytes,
+		"txBytes":      report.TxBytes,
+		"startedAtMs":  report.StartedAtMs,
 	})
 	if err != nil {
 		return false, err

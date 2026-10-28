@@ -22,7 +22,7 @@ func newTestServer(t *testing.T) *Server {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	cfg := &config.Config{ID: "off1", Token: "tok", Capacity: 1}
-	return New(cfg, download.NewRunner(nil, nil, "relay", log), log)
+	return New(cfg, download.NewRunner(nil, nil, "relay", nil, log), log)
 }
 
 // do 发一个请求（请求体可选）并返回响应。
