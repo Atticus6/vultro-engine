@@ -101,9 +101,7 @@ func StartQuickTunnel(ctx context.Context, localURL, protocol string, log *slog.
 			"--protocol", protocol,
 			"--no-autoupdate",
 		})
-		if err != nil && ctx.Err() == nil {
-			log.Error("cloudflared 退出", "err", err)
-		}
+		stopTunnelOnStop(ctx, err, log, os.Exit)
 	}()
 
 	deadline := time.Now().Add(quickTunnelReadyTimeout)
@@ -122,6 +120,29 @@ func StartQuickTunnel(ctx context.Context, localURL, protocol string, log *slog.
 	}
 
 	return "", fmt.Errorf("quick tunnel 在 %s 内未就绪（多半是 UDP/TCP 出网被封，可试 TUNNEL_PROTOCOL=quic）", quickTunnelReadyTimeout)
+}
+
+// stopTunnelOnStop 隧道进程停止后的收尾：ctx 正常取消（进程关闭）时什么也不做；
+// 其余情况一律以 1 退出，由守护进程重启。
+//
+// ## 为什么必须退出，而不是只记一条日志
+//
+// 没有隧道的引擎在 Worker 眼里仍然"在线"：心跳照发、槽位照占，Worker 会把任务派到
+// 一个不可达的地址（每次都要等引擎失联超时才改派）。`RunContext` 可能以 error 返回、
+// 也可能"正常"返回（内部 shutdown），两种都意味着隧道已经不可用。
+//
+// `exit` 抽成参数是为了单测能断言"退出了、退出码是 1"而不真的杀掉测试进程。
+func stopTunnelOnStop(ctx context.Context, runErr error, log *slog.Logger, exit func(int)) {
+	if ctx.Err() != nil {
+		return // 进程正在关闭：这是预期的退出路径
+	}
+	if runErr != nil {
+		log.Error("cloudflared 退出", "err", runErr)
+	} else {
+		log.Error("cloudflared 已退出（RunContext 无错误返回）")
+	}
+	log.Error("内嵌隧道已终止：退出进程，交由守护进程重启（否则 Worker 会把任务派到不可达地址）")
+	exit(1)
 }
 
 // stdioCapture 把进程级 stdout/stderr 接到管道，收集输出并镜像回真实 stderr。
