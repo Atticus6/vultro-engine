@@ -26,8 +26,9 @@ Worker ◀──POST /api/offline/tasks/{id}/finish─── 成功则 Worker �
 - **不持有 S3 密钥、不连数据库**：存储与元数据全在 Worker；
 - **不监听公网、不需要公网 IP**：入站几乎立刻变成一条**进程内 cloudflared 临时隧道**
   （`*.trycloudflare.com`），启动后自动把地址注册给 Worker；
-- **别把宿主机 IP 暴露给源站**：默认 `EGRESS_MODE=warp`，取源站走用户态 WireGuard（WARP），
-  源站看到的是 WARP 出口 IP；
+- **别把宿主机 IP 暴露给源站**：取源站默认经 Worker 转发（`relay`，源站只看到 Cloudflare
+  IP）；Compose 部署把默认值设为 `EGRESS_MODE=warp`，改走用户态 WireGuard（源站看到的
+  是 WARP 出口 IP）。两种模式都不暴露宿主 IP，`direct` 才会；
 - **对「同一 URL 去重」零感知**：看到的永远是普通单会话下载任务；
 - **无本地状态**：断点续传靠派发载荷里的 `uploadedParts`（Worker 从对象存储 `ListParts` 取），
   进程崩溃或任务改派都不需要恢复步骤。
@@ -94,7 +95,7 @@ vultro-engine --print-config
 | `ENGINE_PUBLIC_URL` |      | 留空 = 内嵌临时隧道并自动上报；填了则用外部隧道（不再内嵌）      |
 | `ENGINE_CAPACITY`   |      | 并发槽位（默认 2，1–16；每槽约 64 MiB 内存）                     |
 | `ENGINE_ADDR`       |      | 本地监听（默认 `:8787`）                                         |
-| `EGRESS_MODE`       |      | `relay`（默认）/ `warp` / `direct`                               |
+| `EGRESS_MODE`       |      | `relay`（内置默认）/ `warp`（Compose 默认）/ `direct`            |
 | `EGRESS_PROXY`      |      | 仅 direct：http/https 上游代理（socks5 不支持）                  |
 | `TUNNEL_PROTOCOL`   |      | `http2`（默认）/ `quic` / `auto`                                 |
 | `WARP_IDENTITY_PATH`|      | WARP 身份目录（默认 `./warp-identity`）                          |
@@ -119,9 +120,10 @@ vultro-engine --print-config
   一枚泄漏的任务令牌 = 一个作业的一个会话 + 一条源 URL，而不是整个系统。
 - **relay 不是开放代理**：Worker 的 fetch 端点要求请求 URL 与任务登记的源地址**逐字符相等**。
 - **出口与 IP**：临时隧道只解决**入站**（Worker → 引擎）。源站方向由 `EGRESS_MODE`
-  决定：`warp`（默认）经用户态 WireGuard 出网，源站只看到 WARP IP；`relay` 经 Worker
-  转发，源站看到 Cloudflare IP；`direct` 会暴露宿主 IP。**`warp` 握手失败时进程直接退出**，
-  不会静默退回直连——那会把宿主 IP 漏给源站。
+  决定：`relay`（**内置默认**）经 Worker 转发，源站看到 Cloudflare IP；`warp`
+  （**Compose 部署的默认值**）经用户态 WireGuard 出网，源站只看到 WARP IP；`direct`
+  会暴露宿主 IP。**`warp` 握手失败时进程直接退出**，不会静默退回直连——那会把宿主 IP
+  漏给源站。
 
 ## 自更新（后台一键升级）
 
