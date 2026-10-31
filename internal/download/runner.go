@@ -208,11 +208,16 @@ func (r *Runner) runParts(ctx context.Context, task Task, log *slog.Logger) erro
 
 	lastProgress := time.Time{}
 	for part := 1; part <= task.Session.PartCount; part++ {
-		if ctx.Err() != nil {
-			// 被取消（用户退订归零 / 引擎关闭）或超时：按引擎侧语义回报。
-			// 注：取消与超时的区分在下一个提交里修正（评审发现：原判据看的是永不为
-			// nil 的 parentCtx，取消一律被报成超时）。
-			return fmt.Errorf("任务已超时")
+		/*
+		 * 直接返回 ctx 的错误**类型**：`classifyError` 用 `errors.Is` 区分
+		 * `context.Canceled`（用户退订归零 / 引擎关闭 → cancelled）与
+		 * `context.DeadlineExceeded`（任务截止 → deadline）。
+		 *
+		 * 不能用父 ctx 判断：调度方传的是 `context.Background()`，它的 `Err()` 恒为
+		 * nil——用户取消会全部被报成「任务已超时」，Worker 收到错误的终态原因。
+		 */
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		if uploaded[part] {
 			continue

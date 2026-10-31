@@ -3,6 +3,9 @@ package download
 
 import (
 	"context"
+	"errors"
+	"io"
+	"log/slog"
 	"testing"
 
 	"github.com/atticus6/vultro-engine/internal/worker"
@@ -83,4 +86,31 @@ func TestCancelRegistry(t *testing.T) {
 	// done 必须幂等（Run 的 defer 与调用方兜底都可能调用）。
 	done()
 	done()
+}
+
+// TestRunPartsReportsCancelNotDeadline 取消必须回报 cancelled，不能报成 deadline。
+//
+// 回归点：原判据看的是 `parentCtx.Err()`，而调度方传的是 `context.Background()`——
+// 它永远不会被取消，于是所有用户取消都被回报成「任务已超时」。
+func TestRunPartsReportsCancelNotDeadline(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	runner := NewRunner(nil, nil, "relay", nil, log)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // 模拟用户退订：任务 ctx 已被取消（还没开始下一片）
+
+	var task Task
+	task.TaskID = "t1"
+	task.Session.Mode = "multipart"
+	task.Session.PartCount = 1
+	task.Session.PartSize = 10
+	task.Session.Size = 10
+
+	err := runner.runParts(ctx, task, log)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("runParts 应返回 context.Canceled，得到 %v", err)
+	}
+	if code, _ := classifyError(err); code != "cancelled" {
+		t.Errorf("classifyError = %q, want cancelled", code)
+	}
 }
