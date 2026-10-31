@@ -9,6 +9,7 @@ import (
 )
 
 func TestLoad(t *testing.T) {
+	isolateConfig(t)
 	t.Setenv("ENGINE_ID", "off1")
 	t.Setenv("ENGINE_PUBLIC_URL", "")
 	t.Setenv("ENGINE_TOKEN", "tok")
@@ -52,6 +53,7 @@ func TestLoad(t *testing.T) {
 }
 
 func TestCapacityValidation(t *testing.T) {
+	isolateConfig(t)
 	t.Setenv("ENGINE_ID", "off1")
 	t.Setenv("ENGINE_PUBLIC_URL", "https://off1.example.com")
 	t.Setenv("ENGINE_TOKEN", "tok")
@@ -64,6 +66,7 @@ func TestCapacityValidation(t *testing.T) {
 }
 
 func TestTunnelAndEgressModes(t *testing.T) {
+	isolateConfig(t)
 	t.Setenv("ENGINE_ID", "off1")
 	t.Setenv("ENGINE_TOKEN", "tok")
 	t.Setenv("WORKER_BASE_URL", "http://localhost:8787")
@@ -112,8 +115,20 @@ func clearEnv(t *testing.T) {
 	t.Setenv("ENGINE_CONFIG_FILE", "")
 }
 
-func TestLoadFromConfigFile(t *testing.T) {
+// isolateConfig 同时隔离**默认配置文件路径**。
+//
+// 只清环境变量不够：`pick` 在环境变量为空时会回退到
+// `$XDG_CONFIG_HOME/vultro-engine/config`（否则 `~/.config/...`）。跑过 install.sh 的
+// 开发机上这个文件存在，它会提供令牌、监听地址等值——「缺 ENGINE_TOKEN 应报错」这类断言
+// 就会失败，而 CI 上是绿的（极难复现的假失败）。
+func isolateConfig(t *testing.T) {
+	t.Helper()
 	clearEnv(t)
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+}
+
+func TestLoadFromConfigFile(t *testing.T) {
+	isolateConfig(t)
 	path := writeConfig(t, `
 # 注释与空行都应被忽略
 ENGINE_ID=off1
@@ -142,7 +157,7 @@ export ENGINE_CAPACITY=4
 }
 
 func TestPrecedenceCommandLineOverEnvOverFile(t *testing.T) {
-	clearEnv(t)
+	isolateConfig(t)
 	path := writeConfig(t, `
 ENGINE_ID=from-file
 ENGINE_TOKEN=from-file
@@ -178,7 +193,7 @@ ENGINE_CAPACITY=3
 }
 
 func TestConfigFileErrors(t *testing.T) {
-	clearEnv(t)
+	isolateConfig(t)
 
 	// 显式指定的文件不存在 → 报错（拼错路径不能静默跑默认值）。
 	if _, err := LoadWithOptions(Options{ConfigFile: filepath.Join(t.TempDir(), "missing")}); err == nil {
@@ -199,7 +214,7 @@ func TestConfigFileErrors(t *testing.T) {
 }
 
 func TestMissingRequiredMentionsAllSources(t *testing.T) {
-	clearEnv(t)
+	isolateConfig(t)
 	path := writeConfig(t, "ENGINE_ID=off1\n")
 	_, err := LoadWithOptions(Options{ConfigFile: path})
 	if err == nil {
