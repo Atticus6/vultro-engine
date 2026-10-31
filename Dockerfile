@@ -12,7 +12,9 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 
-COPY main.go ./
+# 根目录的 **所有** 非测试 .go 文件都要拷：main.go 依赖同包的 args.go
+# （parseArgs / usage / printConfig），漏一个就是 `undefined: parseArgs`。
+COPY main.go args.go ./
 COPY internal ./internal
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
     -ldflags "-s -w -X github.com/atticus6/vultro-engine/internal/buildinfo.Version=${VERSION}" \
