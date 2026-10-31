@@ -89,8 +89,12 @@ func (s *Server) handleDispatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 同 id 重复派发（重放）：幂等 202，不再入队——重复执行会重复上传同一批分片。
-	if s.runner.IsRunning(task.TaskID) {
+	/*
+	 * 受理即登记（判重 + 可取消 ctx）——必须在等槽位之前：排队期间任务也要能被
+	 * `POST /v1/tasks/{id}/cancel` 取消、也要能被重放判重（见 `Runner.Begin`）。
+	 */
+	ctx, done, already := s.runner.Begin(context.Background(), task.TaskID)
+	if already {
 		w.WriteHeader(http.StatusAccepted)
 		_ = json.NewEncoder(w).Encode(map[string]bool{"accepted": true, "duplicate": true})
 		return
@@ -101,9 +105,17 @@ func (s *Server) handleDispatch(w http.ResponseWriter, r *http.Request) {
 	s.inflight.Add(1)
 	go func() {
 		defer s.inflight.Add(-1)
-		s.slots <- struct{}{}
+		defer done()
+		select {
+		case s.slots <- struct{}{}:
+		case <-ctx.Done():
+			// 排队期间被取消：不再等槽位，直接收尾（Run 看到已取消的 ctx 会立即
+			// finish(cancelled)），否则一个已无人要的任务会继续占着等待位。
+			s.runner.Run(ctx, task)
+			return
+		}
 		defer func() { <-s.slots }()
-		s.runner.Run(context.Background(), task)
+		s.runner.Run(ctx, task)
 	}()
 
 	w.WriteHeader(http.StatusAccepted)

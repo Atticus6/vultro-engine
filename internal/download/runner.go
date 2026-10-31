@@ -66,10 +66,22 @@ func (r *Runner) Cancel(taskID string) bool {
 	return r.cancels.cancel(taskID)
 }
 
-// IsRunning 任务是否在跑（重复派发判重用）。
+// IsRunning 任务是否在排队或运行中（登记表里有就是）。
 func (r *Runner) IsRunning(taskID string) bool {
 	_, running := r.cancels.lookup(taskID)
 	return running
+}
+
+// Begin 在**受理时**登记任务（判重 + 可取消 ctx），必须在等槽位之前调用。
+//
+// 为什么不能等 Run 里再登记：排队期间任务不在登记表里，Cancel 会落空（返回
+// cancelled=false，槽位空出后照常下载），IsRunning 也判不出重放（同一 taskId 被再次
+// 入队，同一批分片被重复下载/上传）。
+//
+// done 必须在任务结束时调用（注销登记）；already 为真表示同 id 正在排队/运行，调用方
+// 应直接按幂等 202 返回，不要重复入队。
+func (r *Runner) Begin(parent context.Context, taskID string) (context.Context, func(), bool) {
+	return r.cancels.begin(parent, taskID)
 }
 
 // cancelRegistry 取消登记表：taskID → cancel。
@@ -82,16 +94,27 @@ func newCancelRegistry() *cancelRegistry {
 	return &cancelRegistry{cancels: map[string]context.CancelFunc{}}
 }
 
-func (r *cancelRegistry) add(taskID string, cancel context.CancelFunc) {
+// begin 在锁内完成「判重 + 登记」：两次并发派发只会有一个成功，另一个拿到 already。
+func (r *cancelRegistry) begin(parent context.Context, taskID string) (context.Context, func(), bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if _, ok := r.cancels[taskID]; ok {
+		return nil, nil, true
+	}
+	ctx, cancel := context.WithCancel(parent)
 	r.cancels[taskID] = cancel
-}
 
-func (r *cancelRegistry) remove(taskID string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.cancels, taskID)
+	// 注销必须幂等：Run 的 defer 与调用方的兜底都可能触发它。
+	var once sync.Once
+	done := func() {
+		once.Do(func() {
+			cancel()
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			delete(r.cancels, taskID)
+		})
+	}
+	return ctx, done, false
 }
 
 func (r *cancelRegistry) cancel(taskID string) bool {
@@ -115,11 +138,15 @@ func (r *cancelRegistry) lookup(taskID string) (context.CancelFunc, bool) {
 
 // Run 执行一个任务到终态（成功/失败都由这里 finish；不向调用方返回错误——
 // finish 的成败只影响 Worker 侧状态，引擎侧记录日志即可）。
-func (r *Runner) Run(parentCtx context.Context, task Task) {
-	ctx, cancel := context.WithCancel(parentCtx)
-	r.cancels.add(task.TaskID, cancel)
-	defer r.cancels.remove(task.TaskID)
-	defer cancel()
+func (r *Runner) Run(ctx context.Context, task Task) {
+	/*
+	 * 排队期间就被取消：不下载、不占槽位，直接按取消回报。ctx 由 `Begin` 在受理时
+	 * 创建并登记，所以「还没轮到就跑不了」与「运行中途被取消」在这里是同一个判断。
+	 */
+	if ctx.Err() != nil {
+		r.finish(task, worker.FinishResult{OK: false, Code: "cancelled", Message: "任务被取消"})
+		return
+	}
 
 	// 任务截止：Worker 载荷的 deadlineMs 是唯一时钟（72h 级）。
 	if task.DeadlineMs > 0 {
@@ -136,7 +163,7 @@ func (r *Runner) Run(parentCtx context.Context, task Task) {
 	log := r.log.With("task", task.TaskID)
 	log.Info("开始下载", "url", task.Source.URL, "size", task.Session.Size, "mode", task.Session.Mode)
 
-	if err := r.runParts(ctx, parentCtx, task, log); err != nil {
+	if err := r.runParts(ctx, task, log); err != nil {
 		code, message := classifyError(err)
 		r.finish(task, worker.FinishResult{OK: false, Code: code, Message: message})
 		return
@@ -148,7 +175,7 @@ func (r *Runner) Run(parentCtx context.Context, task Task) {
 }
 
 // runParts 逐片取字节并上传。
-func (r *Runner) runParts(ctx context.Context, parentCtx context.Context, task Task, log *slog.Logger) error {
+func (r *Runner) runParts(ctx context.Context, task Task, log *slog.Logger) error {
 	// 已传分片集合（改派场景：跳过，不重传）。
 	uploaded := make(map[int]bool, len(task.Session.UploadedParts))
 	for _, n := range task.Session.UploadedParts {
@@ -183,9 +210,8 @@ func (r *Runner) runParts(ctx context.Context, parentCtx context.Context, task T
 	for part := 1; part <= task.Session.PartCount; part++ {
 		if ctx.Err() != nil {
 			// 被取消（用户退订归零 / 引擎关闭）或超时：按引擎侧语义回报。
-			if parentCtx.Err() == context.Canceled {
-				return fmt.Errorf("任务被取消")
-			}
+			// 注：取消与超时的区分在下一个提交里修正（评审发现：原判据看的是永不为
+			// nil 的 parentCtx，取消一律被报成超时）。
 			return fmt.Errorf("任务已超时")
 		}
 		if uploaded[part] {
