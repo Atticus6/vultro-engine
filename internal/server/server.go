@@ -82,8 +82,17 @@ func (s *Server) handleDispatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	/*
+	 * 先记在途、再查排水：反过来会有一个窗口——`handleUpdate` 的协程在「过了排水检查」
+	 * 与「inflight.Add(1)」之间调用 waitForIdle，看到 0 就 exec 替换进程，把刚回 202
+	 * 的任务中途杀掉。先加计数后检查时，`draining.Swap(true)` 之后读到的 inflight 一定
+	 * 包含这条请求。
+	 */
+	s.inflight.Add(1)
+
 	// 排水中（正在等任务跑完再更新）：明确拒绝，Worker 会把任务退回队列并改派。
 	if s.draining.Load() {
+		s.inflight.Add(-1)
 		w.Header().Set("Retry-After", "30")
 		http.Error(w, `{"error":{"code":"DRAINING","message":"节点正在排空以升级，暂不接新任务"}}`, http.StatusServiceUnavailable)
 		return
@@ -95,6 +104,7 @@ func (s *Server) handleDispatch(w http.ResponseWriter, r *http.Request) {
 	 */
 	ctx, done, already := s.runner.Begin(context.Background(), task.TaskID)
 	if already {
+		s.inflight.Add(-1)
 		w.WriteHeader(http.StatusAccepted)
 		_ = json.NewEncoder(w).Encode(map[string]bool{"accepted": true, "duplicate": true})
 		return
@@ -102,7 +112,6 @@ func (s *Server) handleDispatch(w http.ResponseWriter, r *http.Request) {
 
 	// 槽位满时也先 202：任务入等待队列（goroutine 阻塞在 slots 上），
 	// Worker 侧无需感知引擎的排队深度（capacity/inFlight 已表达）。
-	s.inflight.Add(1)
 	go func() {
 		defer s.inflight.Add(-1)
 		defer done()
