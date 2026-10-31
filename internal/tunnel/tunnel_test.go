@@ -2,10 +2,12 @@
 package tunnel
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 )
 
@@ -45,5 +47,26 @@ func TestStopTunnelOnStop(t *testing.T) {
 		if code != 1 {
 			t.Errorf("退出码应为 1，得到 %d", code)
 		}
+	}
+}
+
+func TestStdioCaptureBufferIsBounded(t *testing.T) {
+	capture := &stdioCapture{}
+	chunk := bytes.Repeat([]byte("x"), 8<<10)
+
+	// 写 20 块（160 KiB）远超上限。
+	for i := 0; i < 20; i++ {
+		chunk[0] = byte('a' + i) // 每块首字节不同，便于验证留下的是"最近"内容
+		capture.appendOutput(chunk)
+	}
+
+	out := capture.String()
+	if len(out) > maxCapturedBytes {
+		t.Fatalf("缓冲应被裁到 %d 字节以内，实际 %d", maxCapturedBytes, len(out))
+	}
+	// 最后写入的那一块必须完整保留（启动阶段的地址/就绪行都在早期日志里，
+	// 裁剪只丢最老的部分）。
+	if !strings.HasSuffix(out, string(chunk)) {
+		t.Error("缓冲应保留最近写入的完整一块")
 	}
 }

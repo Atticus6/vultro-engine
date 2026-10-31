@@ -145,6 +145,13 @@ func stopTunnelOnStop(ctx context.Context, runErr error, log *slog.Logger, exit 
 	exit(1)
 }
 
+// maxCapturedBytes 捕获缓冲的上限（保留最近的一段）。
+//
+// 为什么需要上限：`os.Stdout/os.Stderr` 在进程存活期间一直被接到管道，而就绪检测
+// 只需要启动阶段的那几行（地址 + Registered tunnel connection）。不设上限时，cloudflared
+// 的每条日志都会永久留在内存里，守护进程跑得越久涨得越多。
+const maxCapturedBytes = 64 << 10
+
 // stdioCapture 把进程级 stdout/stderr 接到管道，收集输出并镜像回真实 stderr。
 //
 // 为什么动的是 `os.Stdout/os.Stderr` 而不是某个 logger：cloudflared 的日志器在初始化时
@@ -152,6 +159,21 @@ func stopTunnelOnStop(ctx context.Context, runErr error, log *slog.Logger, exit 
 type stdioCapture struct {
 	mu     sync.Mutex
 	buffer []byte
+}
+
+// appendOutput 追加一段输出，并裁剪到最近 maxCapturedBytes 字节。
+//
+// 裁剪在**原数组内**原地拷贝（而不是重新分配）：稳态下每来一块日志就裁一次，
+// 反复分配 64 KiB 会造成没必要的 GC 压力；原地拷完 len 固定为上限，cap 最多涨到
+// 上限的两倍左右。
+func (c *stdioCapture) appendOutput(chunk []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.buffer = append(c.buffer, chunk...)
+	if len(c.buffer) > maxCapturedBytes {
+		copy(c.buffer, c.buffer[len(c.buffer)-maxCapturedBytes:])
+		c.buffer = c.buffer[:maxCapturedBytes]
+	}
 }
 
 func newStdioCapture() *stdioCapture {
@@ -171,9 +193,7 @@ func newStdioCapture() *stdioCapture {
 		for {
 			n, readErr := reader.Read(buf)
 			if n > 0 {
-				capture.mu.Lock()
-				capture.buffer = append(capture.buffer, buf[:n]...)
-				capture.mu.Unlock()
+				capture.appendOutput(buf[:n])
 				_, _ = realStderr.Write(buf[:n])
 			}
 			if readErr != nil {
