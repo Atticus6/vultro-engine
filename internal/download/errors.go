@@ -21,10 +21,17 @@ func partLength(size, partSize int64, partCount, partNumber int) int64 {
 func classifyError(err error) (code, message string) {
 	var permanent *worker.PermanentError
 	if errors.As(err, &permanent) {
-		if containsAny(permanent.Msg, "404", "410") {
+		// 优先按状态码归类；没有 Status 的调用点（本地错误）退回消息匹配。
+		switch {
+		case permanent.Status >= 400 && permanent.Status < 500:
 			return "source-error-4xx", permanent.Msg
+		case permanent.Status >= 500:
+			return "source-error-5xx", permanent.Msg
+		case containsAny(permanent.Msg, "404", "410"):
+			return "source-error-4xx", permanent.Msg
+		default:
+			return "source-error-5xx", permanent.Msg
 		}
-		return "source-error-5xx", permanent.Msg
 	}
 	if errors.Is(err, context.DeadlineExceeded) || containsAny(err.Error(), "超时") {
 		return "deadline", "任务超时"

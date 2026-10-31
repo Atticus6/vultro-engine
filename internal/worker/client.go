@@ -86,7 +86,7 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any,
 		if (resp.StatusCode >= 400 && resp.StatusCode < 500) && resp.StatusCode != http.StatusRequestTimeout && resp.StatusCode != http.StatusTooManyRequests {
 			snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
 			resp.Body.Close()
-			return &PermanentError{Msg: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, snippet)}
+			return &PermanentError{Msg: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, snippet), Status: resp.StatusCode}
 		}
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
 		resp.Body.Close()
@@ -97,7 +97,14 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any,
 }
 
 // PermanentError 不可重试的错误（4xx 语义）。
-type PermanentError struct{ Msg string }
+//
+// `Status` 是触发它的 HTTP 状态码（0 = 未提供，例如"构造请求失败"这类本地错误）。
+// 下游 `classifyError` 按 4xx/5xx 归类失败原因（source-error-4xx / 5xx），不要靠
+// 消息里是否出现 "404" 这种字符串匹配——那只能认出 404/410 两个码。
+type PermanentError struct {
+	Msg    string
+	Status int
+}
 
 func (e *PermanentError) Error() string { return e.Msg }
 
@@ -238,7 +245,7 @@ func (c *Client) UploadPart(ctx context.Context, taskToken string, sessionID str
 	}
 	snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
 	if resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusRequestTimeout && resp.StatusCode != http.StatusTooManyRequests {
-		return &PermanentError{Msg: fmt.Sprintf("分片上传 HTTP %d: %s", resp.StatusCode, snippet)}
+		return &PermanentError{Msg: fmt.Sprintf("分片上传 HTTP %d: %s", resp.StatusCode, snippet), Status: resp.StatusCode}
 	}
 	return fmt.Errorf("分片上传 HTTP %d: %s", resp.StatusCode, snippet)
 }

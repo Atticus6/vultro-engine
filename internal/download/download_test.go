@@ -41,6 +41,9 @@ func TestClassifyError(t *testing.T) {
 		{&worker.PermanentError{Msg: "HTTP 404: nope"}, "source-error-4xx"},
 		{&worker.PermanentError{Msg: "HTTP 410: gone"}, "source-error-4xx"},
 		{&worker.PermanentError{Msg: "HTTP 502: bad gateway"}, "source-error-5xx"},
+		// 带 Status 的按状态码归类：403 这类不在消息里出现 404/410 的 4xx 也要判对。
+		{&worker.PermanentError{Msg: "源站返回 HTTP 403", Status: 403}, "source-error-4xx"},
+		{&worker.PermanentError{Msg: "HTTP 503: busy", Status: 503}, "source-error-5xx"},
 		{context.DeadlineExceeded, "deadline"},
 		{context.Canceled, "cancelled"},
 	}
@@ -112,5 +115,31 @@ func TestRunPartsReportsCancelNotDeadline(t *testing.T) {
 	}
 	if code, _ := classifyError(err); code != "cancelled" {
 		t.Errorf("classifyError = %q, want cancelled", code)
+	}
+}
+
+func TestSourceStatusError(t *testing.T) {
+	cases := []struct {
+		status    int
+		permanent bool
+	}{
+		{403, true},  // 无权限：重试无意义
+		{404, true},  // 链接失效
+		{408, false}, // 请求超时：稍后重试
+		{429, false}, // 限流：稍后重试
+		{500, false}, // 源站抖动：可重试
+	}
+	for _, c := range cases {
+		err := sourceStatusError(c.status)
+		var permanent *worker.PermanentError
+		if got := errors.As(err, &permanent); got != c.permanent {
+			t.Errorf("sourceStatusError(%d) 的 PermanentError 判定 = %v, want %v（err=%v）",
+				c.status, got, c.permanent, err)
+		}
+		if c.permanent {
+			if code, _ := classifyError(err); code != "source-error-4xx" {
+				t.Errorf("classifyError(sourceStatusError(%d)) = %q, want source-error-4xx", c.status, code)
+			}
+		}
 	}
 }

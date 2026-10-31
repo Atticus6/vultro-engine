@@ -297,7 +297,7 @@ func (r *Runner) fetchRange(ctx context.Context, task Task, rangeHeader string) 
 		}
 		if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
 			resp.Body.Close()
-			return nil, fmt.Errorf("源站返回 HTTP %d", resp.StatusCode)
+			return nil, sourceStatusError(resp.StatusCode)
 		}
 		return r.rxReader(resp.Body), nil
 	}
@@ -309,13 +309,27 @@ func (r *Runner) fetchRange(ctx context.Context, task Task, rangeHeader string) 
 	}
 	if resp.StatusCode == http.StatusForbidden {
 		resp.Body.Close()
-		return nil, &worker.PermanentError{Msg: "relay 出口拒绝（URL 与任务不匹配）"}
+		return nil, &worker.PermanentError{Msg: "relay 出口拒绝（URL 与任务不匹配）", Status: resp.StatusCode}
 	}
 	if resp.StatusCode >= 400 {
 		resp.Body.Close()
-		return nil, fmt.Errorf("relay 取流 HTTP %d", resp.StatusCode)
+		return nil, sourceStatusError(resp.StatusCode)
 	}
 	return r.rxReader(resp.Body), nil
+}
+
+// sourceStatusError 把源站 / relay 的非成功状态翻译成错误：4xx（408/429 除外）是
+// **不可重试**的（链接失效、无权限），其余按可重试的临时错误处理。
+//
+// 必须返回 *worker.PermanentError：`isPermanent` 只认这个类型。此前一律 `fmt.Errorf`，
+// 一个失效链接要重试 5 次（约 30 秒退避），最终还被 `classifyError` 归到
+// source-error-5xx。408/429 显式保留为可重试：它们就是"稍后再来"的语义。
+func sourceStatusError(status int) error {
+	msg := fmt.Sprintf("源站返回 HTTP %d", status)
+	if status >= 400 && status < 500 && status != http.StatusRequestTimeout && status != http.StatusTooManyRequests {
+		return &worker.PermanentError{Msg: msg, Status: status}
+	}
+	return fmt.Errorf("%s", msg)
 }
 
 // rxReader 给源站响应体套下行计数；没有计数器时原样返回（单测构造）。
