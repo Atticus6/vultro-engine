@@ -35,6 +35,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -51,6 +52,26 @@ var githubBase = "https://github.com"
 // updateHTTPTimeout 下载二进制的上限（几十 MB，慢网络也够）。
 const updateHTTPTimeout = 5 * time.Minute
 
+// versionRe 允许的版本号形态：`v1.2.3` / `1.2.3`，可带 `-prerelease` 与 `+build` 后缀。
+//
+// 这是**安全边界**，不是格式洁癖：`SelfUpdate` 的 targetVersion 来自
+// `POST /v1/update` 的请求体，会被直接拼进 release 下载 URL。含 `/`、`..`、`?` 的值能让
+// URL 指到别的仓库/路径（`checksums.txt` 也从同一处取，校验和拦不住同源攻击），最终
+// 把攻击者准备的二进制装到本机并 `syscall.Exec`——一枚泄露的引擎令牌就成了该主机的
+// 远程代码执行。所以拼 URL 之前必须先过白名单正则。
+var versionRe = regexp.MustCompile(`^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?(?:\+[0-9A-Za-z][0-9A-Za-z.-]*)?$`)
+
+// normalizeVersion 校验版本号并补 `v` 前缀（goreleaser 的 tag 带 v，资产名不带）。
+func normalizeVersion(raw string) (string, error) {
+	if !versionRe.MatchString(raw) {
+		return "", fmt.Errorf("版本号格式非法：%q", raw)
+	}
+	if !strings.HasPrefix(raw, "v") {
+		return "v" + raw, nil
+	}
+	return raw, nil
+}
+
 // SelfUpdate 把当前进程更新到 targetVersion（空 = 最新 release）。
 //
 // 成功时**不会返回**：它用 `syscall.Exec` 把进程替换成新二进制（隧道会重建、地址会换，
@@ -64,8 +85,11 @@ func SelfUpdate(ctx context.Context, targetVersion string, log *slog.Logger) err
 		}
 		version = latest
 	}
-	if !strings.HasPrefix(version, "v") {
-		version = "v" + version
+	// 显式指定的版本与 `releases/latest` 重定向里解析出的版本都要过同一道校验：
+	// 后者同样是远端可控的输入（见 versionRe 的说明）。
+	version, err := normalizeVersion(version)
+	if err != nil {
+		return err
 	}
 
 	current, err := os.Executable()

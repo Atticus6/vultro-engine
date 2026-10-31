@@ -9,6 +9,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -118,5 +120,57 @@ func TestDownloadRejectsNon200(t *testing.T) {
 	}
 	if !strings.Contains(releaseAssetName("v0.1.0", "darwin", "amd64"), "0.1.0_darwin_amd64") {
 		t.Fatal("资产名拼装异常")
+	}
+}
+
+func TestNormalizeVersion(t *testing.T) {
+	valid := map[string]string{
+		"1.2.3":         "v1.2.3",
+		"v1.2.3":        "v1.2.3",
+		"v1.2.3-rc.1":   "v1.2.3-rc.1",
+		"v1.2.3+build7": "v1.2.3+build7",
+	}
+	for in, want := range valid {
+		got, err := normalizeVersion(in)
+		if err != nil {
+			t.Errorf("normalizeVersion(%q) 报错: %v", in, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("normalizeVersion(%q) = %q, want %q", in, got, want)
+		}
+	}
+
+	// 这些值会被拼进 release 下载 URL：含路径分隔符 / 查询串的必须拒绝，
+	// 否则能指向别的仓库（checksums.txt 同源，校验和拦不住）。
+	invalid := []string{
+		"",
+		"1.2",
+		"v1.2.3/../../evil",
+		"v1.2.3?x=1",
+		"../v1.2.3",
+		"v1.2.3/",
+		"latest",
+		"v1.2.3-",
+	}
+	for _, in := range invalid {
+		if _, err := normalizeVersion(in); err == nil {
+			t.Errorf("normalizeVersion(%q) 应报错", in)
+		}
+	}
+}
+
+func TestSelfUpdateRejectsUnsafeVersionBeforeAnyIO(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	// 指向不可达地址：若校验没有前置，这里会先撞网络错误而不是格式错误。
+	original := githubBase
+	githubBase = "http://127.0.0.1:1"
+	defer func() { githubBase = original }()
+
+	for _, version := range []string{"v1.2.3/../../evil", "1.2.3?x=1", "../v1.2.3"} {
+		err := SelfUpdate(context.Background(), version, log)
+		if err == nil || !strings.Contains(err.Error(), "版本号格式非法") {
+			t.Errorf("SelfUpdate(%q) 应在格式校验处失败，得到 %v", version, err)
+		}
 	}
 }
